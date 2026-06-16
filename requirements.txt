@@ -1,0 +1,13 @@
+# Core dubbing pipeline (dub.py also auto-installs these on first run).
+faster-whisper
+deep-translator
+edge-tts
+pydub
+piper-tts
+demucs
+numpy
+# Drag-and-drop GUI (dub_app.py)
+tkinterdnd2
+sv-ttk
+# NOTE: ffmpeg is required but is NOT a pip package. Install it separately and put
+# ffmpeg.exe + ffprobe.exe on PATH, or drop an "ffmpeg*/bin" folder next to dub_app.py.

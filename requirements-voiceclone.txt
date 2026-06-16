@@ -1,0 +1,11 @@
+# OPTIONAL add-on: "Clone original speaker's voice" (voiceclone.py).
+# Install these ONLY on a machine with an NVIDIA GPU. Full steps: SETUP_VOICECLONE.md.
+#
+# 1) Install PyTorch with CUDA FIRST (separate index URL - see SETUP_VOICECLONE.md):
+#      pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# 2) Install OpenVoice v2 from GitHub:
+#      pip install git+https://github.com/myshell-ai/OpenVoice.git
+# 3) Support libs (OpenVoice pulls most of its own; listed here for clarity):
+librosa
+soundfile
+wavmark

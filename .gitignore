@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Bundled binaries (do not commit)
+ffmpeg-8.1.1-essentials_build/
+
+# Generated media / working dirs
+downloads/
+music_removed/
+transform/
+ready/
+to_dub/
+dubbed/
+_audio_work/
+
+# Runtime data
+registry.json
+urls.txt
+*.mp4
+*.wav
+*.mp3
+*.srt
+
+# Logs (runtime)
+*.log
+
+# Personal daily lists (real targets / content choices — keep out of git)
+一键清单.txt
+
+# --- Dubbing tool repo: extra ignores ---
+# The Facebook-automation tool is a SEPARATE concern - keep it out of this repo
+fbmachine/
+tests/
+conftest.py
+polish.py
+# Voice-clone model weights (large; download per SETUP_VOICECLONE.md)
+checkpoints/
+checkpoints_v2/
+*.pth
+*.onnx
+*.onnx.json
+# Local app settings + downloaded local voices
+_dubapp_settings.json
+piper_voices/
+processed/
