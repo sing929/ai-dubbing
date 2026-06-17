@@ -76,6 +76,21 @@ _PIPER_CACHE: dict = {}
 # nudge the dub toward the original speaker's pitch. All default voices are female
 # (~190 Hz). If you swap in a male voice above, drop this toward ~110.
 VOICE_REF_F0 = 190.0
+VOICE_REF_F0_MALE = 115.0   # male AI voices sit ~115 Hz; used per-segment in gender mode
+
+# Gender mode: auto-pick a male or female neural voice per line from the original
+# speaker's pitch (F0). edge-tts has a clean male/female pair for every language we
+# support, so gender mode always voices with edge-tts (online), not Piper. F0 below
+# the split reads as male. Heuristic only - deep women / high men / noisy lines can
+# misclassify, and it can't tell two same-gender speakers apart.
+GENDER_F0_SPLIT = 155.0
+GENDER_VOICES = {
+    "vi": {"M": "vi-VN-NamMinhNeural", "F": "vi-VN-HoaiMyNeural"},
+    "id": {"M": "id-ID-ArdiNeural", "F": "id-ID-GadisNeural"},
+    "ms": {"M": "ms-MY-OsmanNeural", "F": "ms-MY-YasminNeural"},
+    "es": {"M": "es-MX-JorgeNeural", "F": "es-MX-DaliaNeural"},
+    "en": {"M": "en-US-GuyNeural", "F": "en-US-AriaNeural"},
+}
 
 # Hard ceiling on how much a long line (translations often run longer than the
 # source) may be sped up to fit its slot. 1.5x stays intelligible; beyond that it
@@ -270,12 +285,17 @@ def transcribe(model, audio_path: str, total_ms: int = 0) -> tuple[list[dict], s
     return out, info.language
 
 
-def tts_all(jobs: list[tuple[str, str]], lang: str) -> list[str | None]:
+def tts_all(jobs: list[tuple[str, str]], lang: str,
+            seg_voices: list[str] | None = None) -> list[str | None]:
     """Synthesize each segment to file. Piper (local, no throttling) for languages
     that have a voice; edge-tts (cloud) as fallback (currently just Indonesian).
-    jobs: list of (text, base_path_no_ext). Returns: per-job output path or None."""
+    jobs: list of (text, base_path_no_ext). Returns: per-job output path or None.
+    seg_voices: when given (gender mode), a per-segment edge-tts voice id - each
+    line is voiced online with its own voice instead of the single language voice."""
     n = len(jobs)
     paths: list[str | None] = []
+    if seg_voices is not None:
+        return asyncio.run(_edge_tts_all(jobs, seg_voices))
     if lang in PIPER_VOICES:
         try:
             voice = _piper_voice(lang)
@@ -311,16 +331,19 @@ def tts_all(jobs: list[tuple[str, str]], lang: str) -> list[str | None]:
 
 
 async def _edge_tts_all(jobs, voice):
+    """voice: one edge-tts voice id for all jobs, or a per-job list of voice ids."""
     n = len(jobs)
+    per_job = isinstance(voice, (list, tuple))
     paths: list[str | None] = []
     for idx, (text, base) in enumerate(jobs, 1):
         text = (text or "").strip()
+        v = voice[idx - 1] if per_job else voice
         path: str | None = None
-        if text and re.search(r"[^\W_]", text, re.UNICODE):
+        if text and v and re.search(r"[^\W_]", text, re.UNICODE):
             path = base + ".mp3"
             for attempt in range(2):
                 try:
-                    await edge_tts.Communicate(text, voice).save(path)
+                    await edge_tts.Communicate(text, v).save(path)
                     break
                 except Exception as e:
                     if attempt == 0:
@@ -333,11 +356,13 @@ async def _edge_tts_all(jobs, voice):
     return paths
 
 
-def fit_segment(mp3: str, wav: str, slot_ms: int, ffmpeg: str) -> AudioSegment:
-    """Load a spoken segment; if it overruns its time slot, speed it up (pitch kept)."""
+def fit_segment(mp3: str, wav: str, slot_ms: int, ffmpeg: str,
+                max_tempo: float = MAX_FIT_TEMPO) -> AudioSegment:
+    """Load a spoken segment; if it overruns its time slot, speed it up (pitch kept).
+    max_tempo caps the speed-up - kept low for XTTS so its natural speech stays clear."""
     seg = AudioSegment.from_file(mp3)
     if slot_ms > 0 and len(seg) / slot_ms > 1.03:
-        tempo = min(len(seg) / slot_ms, MAX_FIT_TEMPO)
+        tempo = min(len(seg) / slot_ms, max_tempo)
         run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
              "-i", mp3, "-filter:a", f"atempo={tempo:.3f}", wav])
         if os.path.exists(wav):
@@ -387,6 +412,15 @@ def estimate_f0(seg: "AudioSegment") -> float | None:
         lag = int(np.argmax(ac[lag_min:lag_max])) + lag_min
         if ac[lag] / ac[0] < 0.4:                 # voicing strength threshold
             continue
+        # Octave guard: autocorrelation often peaks at 2x/3x the true period
+        # (a sub-harmonic), reading the pitch an octave too low - which flips a
+        # female line to "male". If half/third that lag still correlates nearly
+        # as strongly, the real period is the shorter one.
+        for div in (2, 3):
+            sub = lag // div
+            if sub >= lag_min and ac[sub] >= 0.8 * ac[lag]:
+                lag = sub
+                break
         f0s.append(sr / lag)
     if len(f0s) < 3:
         return None
@@ -525,15 +559,111 @@ def _drop_untranslated(lines: list[str], lang: str) -> list[str]:
     return ["" if (ln and cjk.search(ln)) else ln for ln in lines]
 
 
-def translate_segments(lines: list[str], lang: str, source_lang: str = "auto") -> list[str]:
-    """Translate lines, trying Google first and falling back to MyMemory when Google throttles.
+# --- DeepSeek (LLM) translation -------------------------------------------
+# DeepSeek's API is text-only: it translates, but the dubbed VOICE still comes
+# from Piper/edge-tts below. An LLM gives more natural, timing-aware translations
+# than Google MT and sidesteps Google's per-request throttling. Key resolution:
+# explicit arg (GUI field) > DEEPSEEK_API_KEY env var. deepseek-v4-flash is the
+# cheapest/fastest model and is plenty for translation.
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+_LANG_NAMES = {"vi": "Vietnamese", "id": "Indonesian", "ms": "Malay",
+               "es": "Latin American Spanish", "en": "English"}
 
-    Requests are batched to avoid the per-call throttling that hundreds of separate
-    requests trigger. A line that cannot be translated becomes "" (skipped later) -
-    never the original text, which a target-language voice cannot speak.
+
+def _deepseek_key(explicit: str = "") -> str:
+    return (explicit or os.environ.get("DEEPSEEK_API_KEY", "")).strip()
+
+
+def _deepseek_chat(messages: list[dict], api_key: str) -> str | None:
+    """One OpenAI-compatible chat call to DeepSeek. Returns the reply text, or
+    None on any failure (network, auth, bad JSON) so the caller can fall back."""
+    import json as _json
+    import urllib.request
+    body = _json.dumps({"model": DEEPSEEK_MODEL, "messages": messages,
+                        "temperature": 1.3, "stream": False,
+                        "response_format": {"type": "json_object"}}).encode("utf-8")
+    req = urllib.request.Request(
+        DEEPSEEK_URL, data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+def _deepseek_translate(lines: list[str], lang: str, api_key: str,
+                        durations: list[float] | None = None) -> list[str] | None:
+    """Translate every line with DeepSeek. Returns a same-length list, or None if
+    a call fails or the model doesn't return exactly one translation per line.
+    durations: per-line spoken-time budget (seconds). When given, each line is
+    tagged with its budget and the model is told to keep the translation short
+    enough to say in that time - this is what keeps the dub from drifting out of
+    sync when a translation would otherwise run longer than the original line."""
+    import json as _json
+    target = _LANG_NAMES.get(lang, lang)
+    out: list[str] = []
+    pos = 0
+    for chunk in _chunk(lines, 3500):
+        if durations is not None:
+            numbered = "\n".join(f"{i + 1}. ({durations[pos + i]:.1f}s) {ln}"
+                                 for i, ln in enumerate(chunk))
+            budget_rule = (
+                "Each line is prefixed with its spoken-time budget in seconds, "
+                "like (2.3s). Your translation MUST be short enough to say "
+                "naturally within that budget - tighten phrasing and cut filler "
+                "rather than overrun, while keeping the core meaning. ")
+        else:
+            numbered = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(chunk))
+            budget_rule = ("Keep each line about as short as the source so it "
+                           "fits the original speaking time. ")
+        sys_msg = (
+            f"You are a professional video-dubbing translator. Translate each "
+            f"numbered line into natural, spoken {target}, the way a voice actor "
+            f"would say it. {budget_rule}Translate fully - never keep or "
+            f"transliterate the source language. Reply with ONLY a JSON object "
+            f'{{"lines": [...]}} holding exactly {len(chunk)} strings, in order, '
+            f"one per input line.")
+        content = _deepseek_chat(
+            [{"role": "system", "content": sys_msg},
+             {"role": "user", "content": numbered}], api_key)
+        if not content:
+            return None
+        try:
+            parts = _json.loads(content).get("lines")
+        except Exception:
+            parts = None
+        if not isinstance(parts, list) or len(parts) != len(chunk):
+            return None
+        out.extend("" if p is None else str(p) for p in parts)
+        pos += len(chunk)
+    return out
+
+
+def translate_segments(lines: list[str], lang: str, source_lang: str = "auto",
+                       api_key: str = "",
+                       durations: list[float] | None = None) -> list[str]:
+    """Translate lines: DeepSeek first (when a key is set), then Google, then
+    MyMemory. Batched to avoid the throttling hundreds of separate requests
+    trigger. A line that cannot be translated becomes "" (skipped later) - never
+    the original text, which a target-language voice cannot speak.
+    durations: optional per-line spoken-time budget (seconds) passed to DeepSeek
+    so translations stay short enough to keep the dub in sync.
     """
     if not lines:
         return []
+    key = _deepseek_key(api_key)
+    if key:
+        res = _deepseek_translate(lines, lang, key, durations)
+        if res:
+            ok = _drop_untranslated(res, lang)
+            if sum(1 for r in ok if r.strip()) >= len(lines) * 0.6:
+                print(f"  [{lang}] translated via DeepSeek", flush=True)
+                return ok
+        print("  DeepSeek translate failed; falling back to free engine", flush=True)
     try:
         res = _run_translator(GoogleTranslator(source="auto", target=lang), lines, 4500)
         if res:
@@ -573,6 +703,61 @@ def _unique_out(out_dir: str, name: str, lang: str) -> str:
     return p
 
 
+def classify_genders(orig_stats: list[dict] | None, n: int) -> list[str]:
+    """Label each of n segments 'M' or 'F' from its original-voice pitch (F0).
+    A line with no reliable F0 inherits the previous labelled line (speech tends to
+    stay with one speaker), else the video's dominant gender, else 'F'."""
+    raw: list[str | None] = []
+    for i in range(n):
+        st = orig_stats[i] if (orig_stats and i < len(orig_stats)) else None
+        f0 = st.get("f0") if st else None
+        raw.append(("M" if f0 < GENDER_F0_SPLIT else "F") if f0 else None)
+    known = [g for g in raw if g]
+    dominant = "M" if known.count("M") > known.count("F") else "F"
+    out: list[str] = []
+    last = dominant
+    for g in raw:
+        if g:
+            last = g
+        out.append(g or last)
+    return out
+
+
+def build_scene_fx(vocals_path: str, segs: list[dict], total_ms: int,
+                   pad_ms: int = 150, gain_db: float = -9.0) -> "AudioSegment":
+    """Recover scene vocal SFX (panting, grunts, fight shouts) from the original
+    vocals stem WITHOUT the original dialogue: keep the stem only in the gaps
+    between transcribed speech spans, silence the speech spans (where the source
+    language sits), and duck the result so it sits under the dub."""
+    src = AudioSegment.from_file(vocals_path)
+    if len(src) < total_ms:
+        src = src + AudioSegment.silent(total_ms - len(src))
+    src = src[:total_ms]
+    spans: list[list[int]] = []
+    for s in segs:
+        a = max(0, int(s["start"] * 1000) - pad_ms)
+        b = min(total_ms, int(s["end"] * 1000) + pad_ms)
+        if b > a:
+            spans.append([a, b])
+    spans.sort()
+    merged: list[list[int]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    out = AudioSegment.empty()
+    cursor = 0
+    for a, b in merged:
+        if a > cursor:
+            out += src[cursor:a]
+        out += AudioSegment.silent(b - a)
+        cursor = b
+    if cursor < total_ms:
+        out += src[cursor:total_ms]
+    return out + gain_db
+
+
 def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
              video: str, out_dir: str, base: str, work: str, ffmpeg: str,
              source_lang: str = "auto", cover_subs: bool = False, subs_band: int = 18,
@@ -580,7 +765,9 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
              make_srt: bool = False, naming: str = "source", burn_subs: bool = False,
              tone: str = "natural", orig_stats: list[dict] | None = None,
              median_dbfs: float | None = None, audio_only: bool = False,
-             clone: bool = False, vocals: str | None = None) -> None:
+             clone: bool = False, vocals: str | None = None,
+             api_key: str = "", gender_mode: bool = False,
+             scene_fx: bool = False) -> None:
     if naming != "firstline":
         out_mp4 = os.path.join(out_dir, f"{base}_{lang}.mp4")
         if os.path.exists(out_mp4):
@@ -588,7 +775,11 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
             return
 
     print(f"__STAGE__ {lang.upper()}: translating", flush=True)
-    texts = translate_segments([s["text"] for s in segs], lang, source_lang)
+    # Budget each translation to the original line's spoken time so DeepSeek keeps
+    # it short enough to stay in sync (floor avoids an impossible budget on blips).
+    durations = [max(0.6, s["end"] - s["start"]) for s in segs]
+    texts = translate_segments([s["text"] for s in segs], lang, source_lang,
+                               api_key, durations)
     print("__PCT__ 12", flush=True)
 
     if naming == "firstline":
@@ -601,9 +792,31 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
     seg_dir = os.path.join(work, f"tts_{base}_{lang}")
     os.makedirs(seg_dir, exist_ok=True)
     jobs = [(texts[i], os.path.join(seg_dir, f"{i:03d}")) for i in range(len(texts))]
+    seg_voices = None
+    genders = None
+    if gender_mode and lang in GENDER_VOICES:
+        genders = classify_genders(orig_stats, len(jobs))
+        seg_voices = [GENDER_VOICES[lang][g] for g in genders]
+        nm = sum(1 for g in genders if g == "M")
+        print(f"  [{lang}] gender voices: {nm} male / {len(genders) - nm} female lines", flush=True)
     print(f"__STAGE__ {lang.upper()}: voicing", flush=True)
-    paths = tts_all(jobs, lang)
-    if clone and vocals:
+    # English: prefer XTTS v2 (local, natural, and clones the original speaker from
+    # the vocals stem when one is present). It supersedes Piper AND the OpenVoice
+    # clone step for en; when coqui-tts / the model aren't installed available() is
+    # False and we fall back to the normal Piper/edge-tts path. Other languages
+    # (ms/id/vi/es) are unchanged - XTTS doesn't support them.
+    import xtts
+    use_xtts = lang == "en" and xtts.available()
+    if use_xtts:
+        # Clone the original speaker ONLY when the user explicitly ticked "clone".
+        # Cloning a Chinese source voice into English adds a heavy accent that wrecks
+        # clarity, and `vocals` can exist for unrelated reasons (gender / scene-fx /
+        # keep-music all run Demucs), so we must NOT clone by default - use XTTS's
+        # clean built-in English speaker instead.
+        paths = xtts.synthesize(jobs, vocals if clone else None, genders)
+    else:
+        paths = tts_all(jobs, lang, seg_voices)
+    if clone and vocals and not use_xtts:
         print(f"__STAGE__ {lang.upper()}: cloning original voice", flush=True)
         import voiceclone
         paths = voiceclone.clone_segments(paths, vocals, seg_dir, lang, ffmpeg)
@@ -623,10 +836,18 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         nxt = int(segs[i + 1]["start"] * 1000) if i + 1 < len(segs) else total_ms
         room = max(300, nxt - start)                          # time left before the next line
         fit_wav = os.path.join(seg_dir, f"{i:03d}_fit.wav")
-        if tone == "original":
+        if use_xtts:
+            # XTTS speech is already natural but runs a bit longer than the source.
+            # Pitch-warping (tone=original) or hard time-compression mangles neural
+            # speech into the "can't understand it" mush, so for XTTS we do neither:
+            # no pitch shift, only a mild speed-up, and let the timeline drift and
+            # recover at the next pause instead of cramming every line into its slot.
+            seg_audio = fit_segment(path, fit_wav, room, ffmpeg, max_tempo=1.25)
+        elif tone == "original":
             st = orig_stats[i] if (orig_stats and i < len(orig_stats)) else None
             f0 = st.get("f0") if st else None
-            pitch_ratio = (f0 / VOICE_REF_F0) if f0 else 1.0
+            ref = VOICE_REF_F0_MALE if (genders and genders[i] == "M") else VOICE_REF_F0
+            pitch_ratio = (f0 / ref) if f0 else 1.0
             if st and st.get("dbfs") is not None and median_dbfs is not None:
                 gain_db = _clamp(st["dbfs"] - median_dbfs, -6.0, 6.0)
             else:
@@ -647,6 +868,10 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         mixed = music.overlay(voice_track)
     else:
         mixed = voice_track
+
+    if scene_fx and vocals and os.path.exists(vocals):
+        print(f"  [{lang}] keeping scene sounds (panting/shouts) from non-dialogue gaps", flush=True)
+        mixed = mixed.overlay(build_scene_fx(vocals, segs, total_ms))
 
     mix_wav = os.path.join(work, f"{base}_{lang}_mix.wav")
     mixed.export(mix_wav, format="wav")
@@ -720,12 +945,16 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
 
 def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
             subs_band, cover_region, fb_vertical, make_srt, naming, burn_subs=False,
-            tone="natural", audio_only=False, clone=False):
+            tone="natural", audio_only=False, clone=False, api_key="",
+            gender_mode=False, scene_fx=False):
     video = os.path.abspath(video)
     base = os.path.splitext(os.path.basename(video))[0]
     print(f"> {base}: dubbing -> {', '.join(langs)}", flush=True)
     bed, vocals = None, None
-    if keepmusic or clone:
+    # Gender mode judges male/female from the speaker's pitch, which is only
+    # reliable on the isolated voice - so it needs Demucs too, not just the
+    # music-keeping/cloning paths. (bed is dropped below unless keepmusic.)
+    if keepmusic or clone or scene_fx or gender_mode:
         bed, vocals = ensure_bed(video, base, work, ffmpeg)
     if not keepmusic:
         bed = None
@@ -743,7 +972,7 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
         print("  no speech detected; skipping.", flush=True)
         return
     orig_stats, median_dbfs = None, None
-    if tone == "original":
+    if tone == "original" or gender_mode:
         orig = load_orig_audio(video, vocals, work, base, ffmpeg)
         if orig is not None:
             orig_stats, median_dbfs = compute_orig_stats(orig, segs)
@@ -752,7 +981,8 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
     for lang in langs:
         make_dub(lang, segs, total_ms, bed, video, out_dir, base, work, ffmpeg, src_lang,
                  cover_subs, subs_band, cover_region, fb_vertical, make_srt, naming, burn_subs,
-                 tone, orig_stats, median_dbfs, audio_only, clone, vocals)
+                 tone, orig_stats, median_dbfs, audio_only, clone, vocals, api_key, gender_mode,
+                 scene_fx)
 
 
 def _setup(ffmpeg, out_dir, work):
@@ -796,7 +1026,8 @@ def main() -> None:
                         cfg.get("band", 18), region, cfg.get("fb", False),
                         cfg.get("srt", False), cfg.get("naming", "source"),
                         cfg.get("burn", False), tone, cfg.get("audioonly", False),
-                        cfg.get("clone", False))
+                        cfg.get("clone", False), cfg.get("deepseek_key", ""),
+                        cfg.get("gender", False), cfg.get("scenefx", False))
             except Exception as e:
                 print(f"  ERROR on {os.path.basename(video)}: {e}", flush=True)
             print(f"__FILEDONE__ {i}", flush=True)

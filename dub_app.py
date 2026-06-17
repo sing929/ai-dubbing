@@ -174,6 +174,9 @@ class DubApp:
                 "fb": self.fb.get(), "srt": self.srt.get(), "burn": self.burn.get(),
                 "tone": self.tone.get(), "audioonly": self.audioonly.get(),
                 "clone": self.clone.get(),
+                "gender": self.gender.get(),
+                "scenefx": self.scenefx.get(),
+                "deepseek_key": self.deepseek_key.get(),
                 "voices": {lg: self._voice_id(lg) for lg in VOICE_CHOICES},
                 "geom": self.root.geometry(),
                 "queue": [{"path": it["path"],
@@ -338,6 +341,24 @@ class DubApp:
         _Tooltip(cb_clone, "Make the dub SOUND LIKE the original speaker, using OpenVoice on your PC. "
                            "Needs an NVIDIA GPU and the one-time setup in SETUP_VOICECLONE.md. "
                            "If it isn't set up, this safely falls back to the normal voice. Slow on CPU.")
+        self.gender = tk.BooleanVar(value=s.get("gender", False))
+        cb_gender = ttk.Checkbutton(opt, text="Auto male/female voices (match each speaker's gender)",
+                                    variable=self.gender)
+        cb_gender.pack(anchor="w", padx=8)
+        _Tooltip(cb_gender, "Give male lines a male voice and female lines a female voice, judged from "
+                            "the original speaker's pitch. Overrides the per-language voice picker and "
+                            "uses online (edge-tts) voices. Heuristic: deep women / high men / music-heavy "
+                            "lines can misclassify, and two same-gender speakers share a voice. "
+                            "Works best with 'Match original voice' on.")
+        self.scenefx = tk.BooleanVar(value=s.get("scenefx", False))
+        cb_scenefx = ttk.Checkbutton(opt, text="Keep scene sounds (panting/shouts, not music)",
+                                     variable=self.scenefx)
+        cb_scenefx.pack(anchor="w", padx=8)
+        _Tooltip(cb_scenefx, "Bring back the original action sounds (panting, grunts, fight shouts) in the "
+                             "gaps between dialogue, while still dropping the music. Uses the separated "
+                             "voice track, so it needs Demucs (first run downloads it). Note: pure "
+                             "impact/hit sounds live in the music track and won't return, and faint "
+                             "original speech can occasionally leak in the gaps.")
         mf = ttk.Frame(opt)
         mf.pack(fill="x", padx=8, pady=2)
         ttk.Label(mf, text="Accuracy:").pack(side="left")
@@ -359,6 +380,20 @@ class DubApp:
         _Tooltip(lbl_tone,
                  "Match original voice: mimic the original speaker's pace, pitch and loudness "
                  "(still the AI voice).\nNatural (translation): even, calm pacing in the voice's default tone.")
+
+        tr = ttk.LabelFrame(right, text="Translation (optional)")
+        tr.pack(fill="x", pady=(8, 0))
+        kr = ttk.Frame(tr)
+        kr.pack(fill="x", padx=8, pady=5)
+        ttk.Label(kr, text="DeepSeek API key:").pack(side="left")
+        self.deepseek_key = tk.StringVar(value=s.get("deepseek_key", ""))
+        ent_key = ttk.Entry(kr, textvariable=self.deepseek_key, show="•")
+        ent_key.pack(side="left", fill="x", expand=True, padx=4)
+        _Tooltip(ent_key,
+                 "Optional. Paste a DeepSeek API key for higher-quality, timing-aware "
+                 "translation with no Google throttling. The voice itself is unchanged "
+                 "(DeepSeek has no text-to-speech). Saved locally only (gitignored). "
+                 "Blank = free Google translator, or the DEEPSEEK_API_KEY env var.")
 
         rb = ttk.Frame(right)
         rb.pack(fill="x", pady=10)
@@ -708,6 +743,9 @@ class DubApp:
                "srt": self.srt.get(), "naming": "firstline", "burn": self.burn.get(),
                "tone": self.tone.get(), "audioonly": self.audioonly.get(),
                "clone": self.clone.get(),
+               "gender": self.gender.get(),
+               "scenefx": self.scenefx.get(),
+               "deepseek_key": self.deepseek_key.get().strip(),
                "voices": {lg: self._voice_id(lg) for lg in langs.split(",") if lg}}
         try:
             with open(JOBS, "w", encoding="utf-8") as f:
