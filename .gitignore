@@ -46,3 +46,5 @@ checkpoints_v2/
 _dubapp_settings.json
 piper_voices/
 processed/
+# Reference source clones of upstream dependencies (read-only, never committed)
+_refs/

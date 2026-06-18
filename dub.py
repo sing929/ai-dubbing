@@ -9,12 +9,14 @@
 # Usage:
 #   python dub.py <video> <out_dir> <ffmpeg.exe> <work_dir> <langs> [model]
 #   langs  = comma list from: vi (Vietnamese), id (Indonesian), es (Spanish/LatAm)
-#   model  = faster-whisper size: tiny|base|small|medium  (default: small)
+#   model  = faster-whisper size: tiny|base|small|medium  (default: medium)
 
 import sys
 import os
 import re
 import time
+import json
+import hashlib
 import asyncio
 import subprocess
 import importlib.util
@@ -22,6 +24,14 @@ import importlib.util
 # Quieter first-run model download (these are harmless Windows/HF notices).
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+# Force the torch backend for transformers (pulled in by coqui-tts / XTTS). This
+# machine has a broken TensorFlow 2.15 (can't load under NumPy 2.x) in user
+# site-packages; transformers auto-imports any TF it detects, which crashes the
+# XTTS English voice and gets logged as an error. faster-whisper/demucs import
+# transformers before xtts.py runs, so this MUST be set here at the top - before
+# any import below - not in xtts.py. We never use TF here.
+os.environ.setdefault("USE_TF", "0")
 
 
 def ensure_deps() -> None:
@@ -41,6 +51,28 @@ def ensure_deps() -> None:
 
 ensure_deps()
 
+
+def _preinit_torch_cudnn() -> None:
+    """Load torch's cuDNN before CTranslate2 (faster-whisper) loads its own.
+
+    On Windows with the optional voice-clone add-on installed, importing
+    faster-whisper first makes CTranslate2 load an incompatible cuDNN; torch's
+    later load then dies with "Could not load symbol cudnnGetLibConfig" (exit
+    127), killing the whole dub. Forcing a tiny CUDA cuDNN op here pins torch's
+    cuDNN first and avoids the conflict. No-op without torch/CUDA.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            x = torch.randn(1, 1, 4, 4, device="cuda")
+            torch.nn.functional.conv2d(x, torch.randn(1, 1, 3, 3, device="cuda"))
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
+_preinit_torch_cudnn()
+
 from faster_whisper import WhisperModel          # noqa: E402
 from deep_translator import GoogleTranslator, MyMemoryTranslator  # noqa: E402
 import edge_tts                                    # noqa: E402
@@ -53,12 +85,32 @@ except Exception:
     np = None
 
 # Natural female neural voices. Change a value to a *Neural male voice if you prefer.
+# This dict is ALSO the master list of languages the tool accepts (run_one filters
+# the requested langs to keys present here). Languages marked [XTTS] also get the
+# local XTTS v2 natural voice + cloning (see xtts.XTTS_LANGS); the rest use edge-tts.
 VOICES = {
+    # edge-tts only (XTTS v2 doesn't model these)
     "vi": "vi-VN-HoaiMyNeural",   # Vietnamese (female)
     "id": "id-ID-GadisNeural",    # Indonesian (female)
     "ms": "ms-MY-YasminNeural",   # Malay (female)
-    "es": "es-MX-DaliaNeural",    # Spanish - Latin America / Mexico (female)
+    # [XTTS] the 17 languages XTTS v2 supports
     "en": "en-US-AriaNeural",     # English (US, female)
+    "es": "es-MX-DaliaNeural",    # Spanish - Latin America / Mexico (female)
+    "fr": "fr-FR-DeniseNeural",   # French (female)
+    "de": "de-DE-KatjaNeural",    # German (female)
+    "it": "it-IT-ElsaNeural",     # Italian (female)
+    "pt": "pt-BR-FranciscaNeural",  # Portuguese (Brazil, female)
+    "pl": "pl-PL-ZofiaNeural",    # Polish (female)
+    "tr": "tr-TR-EmelNeural",     # Turkish (female)
+    "ru": "ru-RU-SvetlanaNeural",  # Russian (female)
+    "nl": "nl-NL-ColetteNeural",  # Dutch (female)
+    "cs": "cs-CZ-VlastaNeural",   # Czech (female)
+    "ar": "ar-EG-SalmaNeural",    # Arabic (Egypt, female)
+    "zh-CN": "zh-CN-XiaoxiaoNeural",  # Chinese, Simplified (female)
+    "hu": "hu-HU-NoemiNeural",    # Hungarian (female)
+    "ko": "ko-KR-SunHiNeural",    # Korean (female)
+    "ja": "ja-JP-NanamiNeural",   # Japanese (female)
+    "hi": "hi-IN-SwaraNeural",    # Hindi (female)
 }
 
 # Piper local voices (free, no throttling). Indonesian has no Piper voice, so it
@@ -88,14 +140,107 @@ GENDER_VOICES = {
     "vi": {"M": "vi-VN-NamMinhNeural", "F": "vi-VN-HoaiMyNeural"},
     "id": {"M": "id-ID-ArdiNeural", "F": "id-ID-GadisNeural"},
     "ms": {"M": "ms-MY-OsmanNeural", "F": "ms-MY-YasminNeural"},
-    "es": {"M": "es-MX-JorgeNeural", "F": "es-MX-DaliaNeural"},
     "en": {"M": "en-US-GuyNeural", "F": "en-US-AriaNeural"},
+    "es": {"M": "es-MX-JorgeNeural", "F": "es-MX-DaliaNeural"},
+    "fr": {"M": "fr-FR-HenriNeural", "F": "fr-FR-DeniseNeural"},
+    "de": {"M": "de-DE-ConradNeural", "F": "de-DE-KatjaNeural"},
+    "it": {"M": "it-IT-DiegoNeural", "F": "it-IT-ElsaNeural"},
+    "pt": {"M": "pt-BR-AntonioNeural", "F": "pt-BR-FranciscaNeural"},
+    "pl": {"M": "pl-PL-MarekNeural", "F": "pl-PL-ZofiaNeural"},
+    "tr": {"M": "tr-TR-AhmetNeural", "F": "tr-TR-EmelNeural"},
+    "ru": {"M": "ru-RU-DmitryNeural", "F": "ru-RU-SvetlanaNeural"},
+    "nl": {"M": "nl-NL-MaartenNeural", "F": "nl-NL-ColetteNeural"},
+    "cs": {"M": "cs-CZ-AntoninNeural", "F": "cs-CZ-VlastaNeural"},
+    "ar": {"M": "ar-EG-ShakirNeural", "F": "ar-EG-SalmaNeural"},
+    "zh-CN": {"M": "zh-CN-YunxiNeural", "F": "zh-CN-XiaoxiaoNeural"},
+    "hu": {"M": "hu-HU-TamasNeural", "F": "hu-HU-NoemiNeural"},
+    "ko": {"M": "ko-KR-InJoonNeural", "F": "ko-KR-SunHiNeural"},
+    "ja": {"M": "ja-JP-KeitaNeural", "F": "ja-JP-NanamiNeural"},
+    "hi": {"M": "hi-IN-MadhurNeural", "F": "hi-IN-SwaraNeural"},
 }
 
+# Multi-speaker mode: a pool of DISTINCT edge-tts voices per language. When the tool
+# detects N speakers it hands each their own voice by cycling this pool (female/male
+# interleaved so neighbours sound apart). Languages not listed fall back to their
+# female+male GENDER_VOICES pair via _speaker_voices(); XTTS languages instead clone
+# each speaker or use XTTS's own built-in speaker pool (see xtts.SPEAKER_POOL).
+SPEAKER_VOICES = {
+    "en": ["en-US-AriaNeural", "en-US-GuyNeural", "en-US-JennyNeural",
+           "en-US-ChristopherNeural", "en-GB-SoniaNeural", "en-GB-RyanNeural"],
+    "es": ["es-MX-DaliaNeural", "es-MX-JorgeNeural", "es-ES-ElviraNeural",
+           "es-ES-AlvaroNeural", "es-CO-SalomeNeural", "es-AR-TomasNeural"],
+    "vi": ["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"],
+    "id": ["id-ID-GadisNeural", "id-ID-ArdiNeural"],
+    "ms": ["ms-MY-YasminNeural", "ms-MY-OsmanNeural"],
+    "fr": ["fr-FR-DeniseNeural", "fr-FR-HenriNeural", "fr-FR-EloiseNeural", "fr-CA-JeanNeural"],
+    "de": ["de-DE-KatjaNeural", "de-DE-ConradNeural", "de-DE-AmalaNeural", "de-DE-KillianNeural"],
+    "it": ["it-IT-ElsaNeural", "it-IT-DiegoNeural", "it-IT-IsabellaNeural", "it-IT-GiuseppeNeural"],
+    "pt": ["pt-BR-FranciscaNeural", "pt-BR-AntonioNeural", "pt-BR-BrendaNeural", "pt-BR-FabioNeural"],
+    "ru": ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"],
+    "zh-CN": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunjianNeural"],
+    "ja": ["ja-JP-NanamiNeural", "ja-JP-KeitaNeural", "ja-JP-AoiNeural", "ja-JP-DaichiNeural"],
+    "ko": ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural", "ko-KR-JiMinNeural", "ko-KR-HyunsuNeural"],
+}
+
+
+def _speaker_voices(lang: str) -> list[str]:
+    """Ordered list of distinct edge-tts voices to hand out to detected speakers in
+    `lang`. Falls back to the female+male gender pair, then the single default voice."""
+    pool = SPEAKER_VOICES.get(lang)
+    if pool:
+        return pool
+    gv = GENDER_VOICES.get(lang, {})
+    pair = [v for v in (gv.get("F"), gv.get("M")) if v]
+    return pair or [VOICES.get(lang, "en-US-AriaNeural")]
+
+
+def _speaker_gender_voices(lang: str, spk_labels: list[int],
+                           genders: list[str]) -> list[str]:
+    """Voice per line when BOTH multi-speaker and gender mode are on: every distinct
+    speaker is voiced in a voice of THEIR majority gender (a male speaker is never
+    handed a female voice), and same-gender speakers cycle that gender's voice list
+    so they still sound apart. Without this, the speaker round-robin ignored gender
+    entirely and the male/female choice appeared to do nothing."""
+    from collections import Counter
+    fallback = VOICES.get(lang, "en-US-AriaNeural")
+    pool = SPEAKER_VOICES.get(lang, [])
+    # SPEAKER_VOICES is kept female/male interleaved. Split it so two male
+    # characters, or two female characters, do not collapse into the same voice.
+    if pool:
+        pools = {"F": pool[0::2] or [fallback], "M": pool[1::2] or [fallback]}
+    else:
+        gv = GENDER_VOICES.get(lang, {})
+        pools = {"M": [v for v in (gv.get("M"),) if v] or [fallback],
+                 "F": [v for v in (gv.get("F"),) if v] or [fallback]}
+    # A speaker's lines should all share one gender: take the majority vote.
+    votes: dict[int, Counter] = {}
+    for lab, g in zip(spk_labels, genders):
+        votes.setdefault(lab, Counter())[g] += 1
+    spk_gender = {lab: c.most_common(1)[0][0] for lab, c in votes.items()}
+    order: dict[str, dict[int, int]] = {"M": {}, "F": {}}
+
+    def _voice(lab: int) -> str:
+        g = spk_gender[lab]
+        idx = order[g].setdefault(lab, len(order[g]))
+        pool = pools[g]
+        return pool[idx % len(pool)]
+
+    return [_voice(lab) for lab in spk_labels]
+
 # Hard ceiling on how much a long line (translations often run longer than the
-# source) may be sped up to fit its slot. 1.5x stays intelligible; beyond that it
-# sounds chipmunky, so instead we let the timeline drift and recover at the next pause.
-MAX_FIT_TEMPO = 1.5
+# source) may be sped up to fit its slot. Beyond this it sounds chipmunky, so
+# instead we let the timeline drift and recover at the next pause. 1.8x is the
+# practical limit before intelligibility suffers; raise/lower to trade sync vs speed.
+MAX_FIT_TEMPO = 1.45
+# Let an over-long dubbed line push the next line only a little. Bigger drift keeps
+# voices separated but quickly makes the dub feel unsynced with the video.
+MAX_SYNC_DRIFT_MS = 350
+
+# Speak edge-tts (cloud) lines a bit faster at synthesis time. Translations from a
+# terse source language (e.g. Chinese -> Indonesian) run longer than their original
+# slot; generating faster speech reduces how much we must time-stretch afterwards,
+# which keeps the dub better synced. Set to "+0%" to disable.
+EDGE_TTS_RATE = "+6%"
 
 
 def ensure_piper_voice(lang: str) -> str:
@@ -161,6 +306,56 @@ def write_srt(path: str, segs: list[dict], texts: list[str]) -> None:
             f.write(f"{i}\n{srt_ts(s['start'])} --> {srt_ts(s['end'])}\n{(t or '').strip()}\n\n")
 
 
+def _seg_base(seg_dir: str, idx: int, text: str, voice: str = "") -> str:
+    sig = hashlib.sha1(((text or "") + "\0" + (voice or "")).encode("utf-8")).hexdigest()[:10]
+    return os.path.join(seg_dir, f"{idx:03d}_{sig}")
+
+
+def write_project(path: str, *, base: str, source: str, output: str, audio_only: bool,
+                  src_lang: str, lang: str, segs: list[dict], texts: list[str],
+                  spk_labels: list[int] | None = None,
+                  seg_voices: list[str] | None = None,
+                  cast_roles: list[str] | None = None,
+                  cast_genders: list[str] | None = None,
+                  preset: str = "", rights_mode: str = "",
+                  story_bible: dict | None = None) -> None:
+    """Persist a per-run project file (read by web_editor.py) holding the source/output
+    pairing plus the exact per-line source, translation, speaker id and voice. This is
+    what lets the editor show the RIGHT translated video and real speaker labels without
+    re-translating. Best-effort: a failure here must never break the dub."""
+    if src_lang in ("", "auto") and segs:
+        src_lang = segs[0].get("lang", "auto")
+    segments = []
+    for i, s in enumerate(segs):
+        segments.append({
+            "i": i,
+            "start": round(float(s.get("start", 0.0)), 3),
+            "end": round(float(s.get("end", 0.0)), 3),
+            "src": s.get("text", ""),
+            "tr": texts[i] if i < len(texts) else "",
+            "speaker": int(spk_labels[i]) if (spk_labels is not None and i < len(spk_labels)) else 0,
+            "role": cast_roles[i] if (cast_roles is not None and i < len(cast_roles)) else None,
+            "gender": cast_genders[i] if (cast_genders is not None and i < len(cast_genders)) else None,
+            "voice": seg_voices[i] if (seg_voices is not None and i < len(seg_voices)) else None,
+            "source_track": s.get("source"),
+        })
+    data = {
+        "version": 1, "base": base,
+        "source": os.path.abspath(source), "output": os.path.abspath(output),
+        "audio_only": audio_only, "src_lang": src_lang, "lang": lang,
+        "preset": preset, "rights_mode": rights_mode,
+        "story_bible": story_bible or {},
+        "created": int(time.time()),
+        "duration": round(float(segs[-1]["end"]), 3) if segs else 0.0,
+        "segments": segments,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [warn] could not write project file: {e}", flush=True)
+
+
 def ffprobe_dims(path: str, ffmpeg: str) -> tuple[int, int]:
     ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe")
     if not os.path.exists(ffprobe):
@@ -199,40 +394,56 @@ def ass_ts(sec: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+def _ass_escape_one_line(text: str) -> str:
+    """ASS-safe subtitle text forced onto one visual line."""
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    return text.replace("\\", "/").replace("{", "(").replace("}", ")")
+
+
+def _one_line_font_size(text: str, box_w: int, box_h: int,
+                        frame_h: int, size_from_rect: bool) -> int:
+    """Pick a font size that fits one line inside the original subtitle box."""
+    max_h = max(16, int(box_h * (0.62 if size_from_rect else 0.38)))
+    base = int(_clamp(max_h, 18, round(frame_h * 0.045)))
+    max_w = max(80, box_w * 0.92)
+    # Rough visual width: CJK/fullwidth chars are about 1em, Latin about 0.55em.
+    units = sum(1.0 if ord(ch) > 255 else 0.55 for ch in text)
+    if units > 0:
+        base = min(base, int(max_w / units))
+    return int(_clamp(base, 16, round(frame_h * 0.045)))
+
+
 def write_ass(path: str, segs: list[dict], texts: list[str], frame_w: int,
               frame_h: int, rect: list[float] | None, size_from_rect: bool) -> None:
-    """Write burned subtitles as ASS, positioned over the original subtitle area
-    (rect) at roughly the original wording's size. rect=None -> bottom band."""
+    """Write one-line burned subtitles inside the original subtitle area only."""
     if rect and len(rect) == 4:
         x, y, w, h = rect
     else:
         x, y, w, h = 0.0, 0.80, 1.0, 0.16
-    if size_from_rect:
-        fs = int(_clamp(round(h * frame_h * 0.72), 22, round(frame_h * 0.12)))
-    else:
-        fs = max(22, round(frame_h * 0.045))
-    pad = round(0.015 * frame_h)
-    if (y + h / 2.0) <= 0.5:
-        align, mv = 8, max(pad, round(y * frame_h))                 # top-center
-    else:
-        align, mv = 2, max(pad, round((1.0 - (y + h)) * frame_h))   # bottom-center
-    ml = max(0, round(x * frame_w))
-    mr = max(0, round((1.0 - (x + w)) * frame_w))
-    outline = max(2, round(fs * 0.07))
+    x1 = max(0, round(x * frame_w))
+    y1 = max(0, round(y * frame_h))
+    x2 = min(frame_w, round((x + w) * frame_w))
+    y2 = min(frame_h, round((y + h) * frame_h))
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+    cx = x1 + box_w // 2
+    cy = y1 + box_h // 2
+    default_fs = int(_clamp(round(box_h * 0.38), 18, round(frame_h * 0.045)))
+    outline = max(2, round(default_fs * 0.07))
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
         f"PlayResX: {frame_w}\n"
         f"PlayResY: {frame_h}\n"
-        "WrapStyle: 0\n"
+        "WrapStyle: 2\n"
         "ScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
         "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,Arial,{fs},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-        f"0,0,0,0,100,100,0,0,1,{outline},0,{align},{ml},{mr},{mv},1\n\n"
+        f"Style: Default,Arial,{default_fs},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        f"0,0,0,0,100,100,0,0,1,{outline},0,5,0,0,0,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -242,17 +453,33 @@ def write_ass(path: str, segs: list[dict], texts: list[str], frame_w: int,
             t = (t or "").strip()
             if not t:
                 continue
-            t = t.replace("\\", "/").replace("{", "(").replace("}", ")")
-            t = t.replace("\r\n", "\\N").replace("\n", "\\N").replace("\r", "\\N")
+            t = _ass_escape_one_line(t)
+            fs = _one_line_font_size(t, box_w, box_h, frame_h, size_from_rect)
+            tag = f"{{\\an5\\pos({cx},{cy})\\clip({x1},{y1},{x2},{y2})\\fs{fs}}}"
             f.write(f"Dialogue: 0,{ass_ts(s['start'])},{ass_ts(s['end'])},"
-                    f"Default,,0,0,0,,{t}\n")
+                    f"Default,,0,0,0,,{tag}{t}\n")
 
 
 def ensure_bed(video: str, base: str, work: str, ffmpeg: str) -> tuple[str | None, str | None]:
-    """Return (music_bed, clean_vocals) paths, reusing Demucs output if present."""
+    """Return (music_bed, clean_vocals) paths, reusing Demucs output only when it
+    was produced from THIS video. Two different videos that share a filename (the
+    browser saves every download as 'download.mp4') must NOT reuse each other's
+    separated voice - otherwise the dub clones the previous video's speaker. The
+    cached output is therefore tagged with the source's size+mtime, the same
+    fingerprint load_analysis() uses, and re-separated when that changes."""
     bed = os.path.join(work, "htdemucs", base, "no_vocals.wav")
     vocals = os.path.join(work, "htdemucs", base, "vocals.wav")
-    if os.path.exists(bed):
+    sig_path = os.path.join(work, "htdemucs", base, ".source.json")
+    cur_sig = _video_sig(video)
+
+    def _cached_sig() -> dict | None:
+        try:
+            with open(sig_path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    if os.path.exists(bed) and _cached_sig() == cur_sig:
         return bed, (vocals if os.path.exists(vocals) else None)
 
     stem = os.path.join(work, base + ".wav")
@@ -261,9 +488,35 @@ def ensure_bed(video: str, base: str, work: str, ffmpeg: str) -> tuple[str | Non
     print("  separating voice/music with Demucs (first run downloads ~80MB model)...")
     subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-o", work, stem])
     if os.path.exists(bed):
+        try:
+            with open(sig_path, "w", encoding="utf-8") as f:
+                json.dump(cur_sig, f)
+        except Exception:
+            pass
         return bed, (vocals if os.path.exists(vocals) else None)
     print("  Demucs unavailable; original music will be dropped (voice-only dub).")
     return None, None
+
+
+# Unicode blocks that pin a line to one language. Han (CJK) alone is ambiguous
+# (shared by Chinese and Japanese), so KANA decides Japanese and HANGUL decides
+# Korean; a line with only Han characters is read as Chinese.
+_RE_HANGUL = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]")
+_RE_KANA = re.compile(r"[぀-ゟ゠-ヿ]")          # hiragana + katakana
+_RE_HAN = re.compile(r"[㐀-鿿豈-﫿]")
+
+
+def _script_lang(text: str) -> str | None:
+    """Best-guess language of one transcribed line from its script. Returns a
+    source code (zh/ja/ko) or None when the script doesn't pin a language (e.g.
+    Latin/Cyrillic, which the acoustic detector already labelled)."""
+    if _RE_HANGUL.search(text):
+        return "ko"
+    if _RE_KANA.search(text):
+        return "ja"
+    if _RE_HAN.search(text):
+        return "zh"
+    return None
 
 
 def transcribe(model, audio_path: str, total_ms: int = 0) -> tuple[list[dict], str]:
@@ -271,18 +524,101 @@ def transcribe(model, audio_path: str, total_ms: int = 0) -> tuple[list[dict], s
     # Douyin clips are music-heavy; without these, Whisper loops and re-emits the last
     # line as hundreds of duplicate Chinese segments (the "repeating" bug). Disabling
     # previous-text conditioning + an n-gram repeat guard stops the loop.
+    #   multilingual=True            -> detect language PER chunk, so a mostly-Chinese
+    #                                   clip with stray Korean/Japanese lines transcribes
+    #                                   each in its own language instead of forcing one.
+    #   language_detection_segments  -> sample several windows (not just the first) so the
+    #                                   dominant language is right even if it opens on music.
+    # VAD gate kept (it stops the music-loop bug) but deliberately permissive:
+    # short/quiet in-video dialogue often sits under narration, SFX, or music and was
+    # being dropped before translation. We prefer a few extra subtitle lines over
+    # missing obvious dialogue; Demucs vocals (when available) keeps false positives
+    # tolerable.
     segments, info = model.transcribe(
-        audio_path, vad_filter=True,
+        audio_path, vad_filter=True, multilingual=True,
+        vad_parameters=dict(threshold=0.22, min_silence_duration_ms=180,
+                            min_speech_duration_ms=80, speech_pad_ms=320),
+        language_detection_segments=8, language_detection_threshold=0.35,
         condition_on_previous_text=False, no_repeat_ngram_size=3)
     out: list[dict] = []
+    seen: dict[str, int] = {}        # source code -> total characters, to rank the mix
     for s in segments:
         text = (s.text or "").strip()
         if text:
-            out.append({"start": s.start, "end": s.end, "text": text})
+            slang = _script_lang(text) or info.language
+            out.append({"start": s.start, "end": s.end, "text": text, "lang": slang})
+            seen[slang] = seen.get(slang, 0) + len(text)
         if total_ms > 0:
             print(f"__PCT__ {min(99, int(s.end * 1000 / total_ms * 100))}", flush=True)
-    print(f"  source language: {info.language}   segments: {len(out)}", flush=True)
-    return out, info.language
+    # Dominant source = the language covering the most transcribed text (falls back to
+    # Whisper's own guess when nothing scriptable was found, e.g. an all-Latin clip).
+    dominant = max(seen, key=seen.get) if seen else info.language
+    others = sorted((l for l in seen if l != dominant), key=seen.get, reverse=True)
+    mix = f"   (also: {', '.join(others)})" if others else ""
+    print(f"  source language: {dominant}{mix}   segments: {len(out)}", flush=True)
+    return out, dominant
+
+
+def _dominant_lang(segs: list[dict], fallback: str = "auto") -> str:
+    seen: dict[str, int] = {}
+    for s in segs:
+        lang = s.get("lang") or fallback
+        seen[lang] = seen.get(lang, 0) + len(s.get("text", ""))
+    return max(seen, key=seen.get) if seen else fallback
+
+
+def _overlap_ratio(a: dict, b: dict) -> float:
+    lo = max(float(a.get("start", 0.0)), float(b.get("start", 0.0)))
+    hi = min(float(a.get("end", 0.0)), float(b.get("end", 0.0)))
+    ov = max(0.0, hi - lo)
+    dur = max(0.01, min(float(a.get("end", 0.0)) - float(a.get("start", 0.0)),
+                        float(b.get("end", 0.0)) - float(b.get("start", 0.0))))
+    return ov / dur
+
+
+def merge_transcripts(primary: list[dict], fallback: list[dict]) -> tuple[list[dict], int]:
+    """Add fallback full-mix lines that do not overlap the cleaner vocals transcript.
+
+    Demucs vocals usually improve transcription, but it can remove quiet in-scene
+    dialogue along with music/SFX. A second full-mix pass can recover those missing
+    lines; we only add lines that are temporally distinct so duplicates stay rare.
+    """
+    out = [dict(s, source=s.get("source", "vocals")) for s in primary]
+    added = 0
+    for s in fallback:
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        if any(_overlap_ratio(s, p) >= 0.35 for p in out):
+            continue
+        out.append(dict(s, source="fullmix"))
+        added += 1
+    out.sort(key=lambda x: (float(x.get("start", 0.0)), float(x.get("end", 0.0))))
+    return out, added
+
+
+def transcribe_for_dub(model, video: str, vocals: str | None, total_ms: int,
+                      dual_pass: bool = False) -> tuple[list[dict], str, dict]:
+    """Transcribe with the best available source and optional full-mix recovery."""
+    if vocals and os.path.exists(vocals):
+        segs, src_lang = transcribe(model, vocals, total_ms)
+        for s in segs:
+            s["source"] = "vocals"
+        meta = {"primary": "vocals", "dual_pass": False, "added_fullmix": 0}
+        if dual_pass:
+            print("__STAGE__ Transcribing full mix for missed dialogue", flush=True)
+            alt, _alt_lang = transcribe(model, video, total_ms)
+            segs, added = merge_transcripts(segs, alt)
+            src_lang = _dominant_lang(segs, src_lang)
+            meta.update({"dual_pass": True, "alt_segments": len(alt),
+                         "added_fullmix": added})
+            if added:
+                print(f"  recovered {added} extra dialogue lines from full mix", flush=True)
+        return segs, src_lang, meta
+    segs, src_lang = transcribe(model, video, total_ms)
+    for s in segs:
+        s["source"] = "fullmix"
+    return segs, src_lang, {"primary": "fullmix", "dual_pass": False, "added_fullmix": 0}
 
 
 def tts_all(jobs: list[tuple[str, str]], lang: str,
@@ -306,6 +642,10 @@ def tts_all(jobs: list[tuple[str, str]], lang: str,
                 # Skip segments with nothing speakable (music marks, lone punctuation, symbols).
                 if text and re.search(r"[^\W_]", text, re.UNICODE):
                     path = base + ".wav"
+                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                        paths.append(path)
+                        print(f"__PCT__ {12 + int(73 * idx / n)}", flush=True)
+                        continue
                     try:
                         # piper-tts >=1.3 returns AudioChunk objects from synthesize();
                         # we have to set the wave params from the first chunk ourselves.
@@ -341,9 +681,13 @@ async def _edge_tts_all(jobs, voice):
         path: str | None = None
         if text and v and re.search(r"[^\W_]", text, re.UNICODE):
             path = base + ".mp3"
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                paths.append(path)
+                print(f"__PCT__ {12 + int(73 * idx / n)}", flush=True)
+                continue
             for attempt in range(2):
                 try:
-                    await edge_tts.Communicate(text, v).save(path)
+                    await edge_tts.Communicate(text, v, rate=EDGE_TTS_RATE).save(path)
                     break
                 except Exception as e:
                     if attempt == 0:
@@ -433,10 +777,12 @@ def load_orig_audio(video: str, vocals: str | None, work: str, base: str,
     vocals stem (clean) when present, else a mono 16k extract of the video."""
     src = vocals if (vocals and os.path.exists(vocals)) else None
     if src is None:
+        # No clean vocals: fall back to a mono 16k extract. Always re-extract from
+        # THIS video rather than trusting a same-named leftover, so a re-uploaded
+        # "download.mp4" can't analyse the previous clip's audio.
         src = os.path.join(work, base + "_orig16k.wav")
-        if not os.path.exists(src):
-            run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                 "-i", video, "-vn", "-ac", "1", "-ar", "16000", src])
+        run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+             "-i", video, "-vn", "-ac", "1", "-ar", "16000", src])
         if not os.path.exists(src):
             return None
     try:
@@ -481,7 +827,11 @@ def fit_segment_expressive(src: str, out_wav: str, target_ms: int,
     length = len(seg)
     if length <= 0 or target_ms <= 0:
         return seg + gain_db if gain_db else seg
-    tempo = _clamp(length / target_ms, 0.7, MAX_FIT_TEMPO)
+    # Cap the speed-up tighter than the global ceiling: this path also pitch-shifts
+    # the voice, and stacking a >1.5x tempo on top turns speech into the "can't make
+    # it out" mush the user hit. Over-long lines instead drift and recover at the
+    # next pause (see the overlay loop), which is far more intelligible.
+    tempo = _clamp(length / target_ms, 0.7, 1.35)
     p = _clamp(pitch_ratio, 0.85, 1.18)
     if abs(tempo - 1.0) < 0.04 and abs(p - 1.0) < 0.02:
         return seg + gain_db if gain_db else seg
@@ -501,17 +851,21 @@ def fit_segment_expressive(src: str, out_wav: str, target_ms: int,
 
 
 # MyMemory (the fallback) needs explicit locale codes; Google is happy with short codes + auto-detect.
-_MM_TARGET = {"vi": "vi-VN", "id": "id-ID", "ms": "ms-MY", "es": "es-ES", "en": "en-US"}
+_MM_TARGET = {"vi": "vi-VN", "id": "id-ID", "ms": "ms-MY", "es": "es-ES", "en": "en-US",
+              "fr": "fr-FR", "de": "de-DE", "it": "it-IT", "pt": "pt-BR", "pl": "pl-PL",
+              "tr": "tr-TR", "ru": "ru-RU", "nl": "nl-NL", "cs": "cs-CZ", "ar": "ar-SA",
+              "zh-CN": "zh-CN", "hu": "hu-HU", "ko": "ko-KR", "ja": "ja-JP", "hi": "hi-IN"}
 _MM_SOURCE = {"zh": "zh-CN", "ko": "ko-KR", "ja": "ja-JP", "en": "en-GB",
               "ms": "ms-MY", "th": "th-TH", "vi": "vi-VN", "id": "id-ID", "es": "es-ES"}
 
 
-def _chunk(lines: list[str], max_chars: int) -> list[list[str]]:
+def _chunk(lines: list[str], max_chars: int, max_lines: int = 0) -> list[list[str]]:
     chunks: list[list[str]] = []
     cur: list[str] = []
     size = 0
     for ln in lines:
-        if cur and size + len(ln) + 1 > max_chars:
+        if cur and (size + len(ln) + 1 > max_chars
+                    or (max_lines and len(cur) >= max_lines)):
             chunks.append(cur)
             cur, size = [], 0
         cur.append(ln)
@@ -552,8 +906,10 @@ def _run_translator(tr, lines: list[str], max_chars: int) -> list[str] | None:
 def _drop_untranslated(lines: list[str], lang: str) -> list[str]:
     """A target-language voice can't speak Chinese. If a line comes back still
     containing CJK characters (translation throttled and passed the source through),
-    blank it so it is skipped rather than voiced as gibberish."""
-    if lang.startswith("zh"):
+    blank it so it is skipped rather than voiced as gibberish.
+    Exempt CJK target languages (Chinese/Japanese/Korean) - their correct
+    translations are *made of* these characters, so we must not blank them."""
+    if lang.startswith(("zh", "ja", "ko")):
         return lines
     cjk = re.compile(r"[㐀-鿿぀-ヿ가-힯]")
     return ["" if (ln and cjk.search(ln)) else ln for ln in lines]
@@ -568,84 +924,271 @@ def _drop_untranslated(lines: list[str], lang: str) -> list[str]:
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 _LANG_NAMES = {"vi": "Vietnamese", "id": "Indonesian", "ms": "Malay",
-               "es": "Latin American Spanish", "en": "English"}
+               "es": "Latin American Spanish", "en": "English",
+               "fr": "French", "de": "German", "it": "Italian",
+               "pt": "Brazilian Portuguese", "pl": "Polish", "tr": "Turkish",
+               "ru": "Russian", "nl": "Dutch", "cs": "Czech", "ar": "Arabic",
+               "zh-CN": "Simplified Chinese", "hu": "Hungarian", "ko": "Korean",
+               "ja": "Japanese", "hi": "Hindi"}
 
 
 def _deepseek_key(explicit: str = "") -> str:
     return (explicit or os.environ.get("DEEPSEEK_API_KEY", "")).strip()
 
 
-def _deepseek_chat(messages: list[dict], api_key: str) -> str | None:
+def _deepseek_chat(messages: list[dict], api_key: str,
+                   temperature: float = 1.0, max_tokens: int = 8192) -> str | None:
     """One OpenAI-compatible chat call to DeepSeek. Returns the reply text, or
-    None on any failure (network, auth, bad JSON) so the caller can fall back."""
-    import json as _json
+    None on failure. max_tokens is set to DeepSeek's ceiling so a long batch reply
+    isn't silently truncated into invalid JSON. Real errors (bad key, rate limit)
+    are printed - they used to be swallowed, hiding why the dub fell back to the
+    free engine."""
     import urllib.request
-    body = _json.dumps({"model": DEEPSEEK_MODEL, "messages": messages,
-                        "temperature": 1.3, "stream": False,
-                        "response_format": {"type": "json_object"}}).encode("utf-8")
+    import urllib.error
+    body = json.dumps({"model": DEEPSEEK_MODEL, "messages": messages,
+                       "temperature": temperature, "stream": False,
+                       "max_tokens": max_tokens,
+                       "response_format": {"type": "json_object"}}).encode("utf-8")
     req = urllib.request.Request(
         DEEPSEEK_URL, data=body,
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {api_key}"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = _json.loads(r.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"]
-    except Exception:
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:160]
+        except Exception:
+            detail = ""
+        print(f"  DeepSeek HTTP {e.code}: {detail}", flush=True)
+        return None
+    except Exception as e:
+        print(f"  DeepSeek request error: {str(e)[:120]}", flush=True)
         return None
 
 
+def _deepseek_chat_fn(api_key: str):
+    """Return a plain chat(system, user) -> str|None callable bound to DeepSeek, for
+    add-on modules (speech_rate length-fit) that just need 'send these two messages,
+    get the reply'. _deepseek_chat already forces a JSON-object response, which the
+    speech_rate prompts ask for; a cooler temperature keeps the rewrite faithful."""
+    def _chat(system: str, user: str) -> str | None:
+        return _deepseek_chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}], api_key, temperature=0.7)
+    return _chat
+
+
+# Keep each DeepSeek request small. A big batch (the old 3500-char chunk = ~130
+# dense-Chinese lines) makes the model miscount its output lines OR emit invalid
+# JSON (an unescaped quote inside a translation), and EITHER one used to throw the
+# whole translation away and fall back to the free engine. ~40 lines / 1200 chars
+# per request keeps the line count exact and the JSON valid.
+_DS_MAX_LINES = 40
+_DS_MAX_CHARS = 1200
+
+
+def build_story_bible(lines: list[str], api_key: str) -> dict | None:
+    """Infer story context once so translation can resolve Chinese pronouns.
+
+    Chinese drama recaps often use 他/她/TA loosely or inconsistently in captions.
+    Translating small batches without a global cast list makes the model flip gender
+    mid-story. This lightweight "bible" is cached per script and passed to every
+    translation batch as context.
+    """
+    key = _deepseek_key(api_key)
+    if not key or not lines:
+        return None
+    joined = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(lines))
+    if len(joined) > 24000:
+        # Keep prompt size bounded; first/middle/end is enough for cast inference.
+        head = lines[:80]
+        mid0 = max(80, len(lines) // 2 - 40)
+        mid = lines[mid0:mid0 + 80]
+        tail = lines[-80:]
+        sample = head + ["..."] + mid + ["..."] + tail
+        joined = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(sample))
+    sys_msg = (
+        "You are a story analyst for Chinese drama dubbing. Read the whole subtitle "
+        "script and infer a compact translation bible. Chinese captions may use 他, 她, "
+        "TA, or the wrong homophone/character inconsistently; infer the actual gender "
+        "from names, relationships, plot facts, titles, and repeated actions. Do not "
+        "guess wildly: mark unknown when uncertain. Reply with ONLY JSON containing: "
+        '{"summary":"...","characters":[{"name":"...","aliases":["..."],'
+        '"gender":"M|F|unknown","role":"...","relationships":"..."}],'
+        '"pronoun_notes":["..."],"translation_rules":["..."]}.')
+    content = _deepseek_chat(
+        [{"role": "system", "content": sys_msg},
+         {"role": "user", "content": joined}], key, temperature=0.2)
+    if not content:
+        return None
+    try:
+        data = json.loads(content)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    chars = data.get("characters")
+    if not isinstance(chars, list):
+        chars = []
+    data["characters"] = chars[:12]
+    data["summary"] = str(data.get("summary", ""))[:600]
+    data["pronoun_notes"] = [str(x)[:180] for x in (data.get("pronoun_notes") or [])[:12]]
+    data["translation_rules"] = [str(x)[:180] for x in (data.get("translation_rules") or [])[:12]]
+    return data
+
+
+def _story_bible_brief(story_bible: dict | None) -> str:
+    if not story_bible:
+        return ""
+    parts = []
+    if story_bible.get("summary"):
+        parts.append("Story summary: " + str(story_bible["summary"]))
+    chars = []
+    for c in story_bible.get("characters") or []:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name", "")).strip()
+        gender = str(c.get("gender", "unknown")).strip()
+        role = str(c.get("role", "")).strip()
+        aliases = ", ".join(str(a) for a in (c.get("aliases") or [])[:4])
+        rel = str(c.get("relationships", "")).strip()
+        chars.append(f"{name or 'unknown'} ({gender}; {role}; aliases: {aliases}; {rel})")
+    if chars:
+        parts.append("Characters: " + " | ".join(chars[:12]))
+    notes = story_bible.get("pronoun_notes") or []
+    if notes:
+        parts.append("Pronoun/gender notes: " + " | ".join(str(n) for n in notes[:12]))
+    rules = story_bible.get("translation_rules") or []
+    if rules:
+        parts.append("Rules: " + " | ".join(str(r) for r in rules[:8]))
+    return "\n".join(parts)[:3500]
+
+
+def _ds_span(lines: list[str], target: str, api_key: str,
+             durations: list[float] | None, depth: int = 0,
+             story_bible: dict | None = None) -> list[str | None]:
+    """Translate one batch of lines via DeepSeek, returning a same-length list
+    (None for any line we couldn't get). On a bad reply (wrong line count, or
+    JSON the model malformed) we retry at a cooler temperature; if it still fails
+    and the batch has more than one line, we SPLIT it and translate the halves -
+    smaller batches are far more reliable - instead of discarding everything and
+    dropping to the free engine."""
+    if not lines:
+        return []
+    if durations is not None:
+        numbered = "\n".join(f"{i + 1}. ({durations[i]:.1f}s) {ln}"
+                             for i, ln in enumerate(lines))
+        budget_rule = (
+            "Each line is prefixed with its spoken-time budget in seconds, "
+            "like (2.3s). Your translation MUST be short enough to say "
+            "naturally within that budget - tighten phrasing and cut filler "
+            "rather than overrun, while keeping the core meaning. ")
+    else:
+        numbered = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(lines))
+        budget_rule = ("Keep each line about as short as the source so it "
+                       "fits the original speaking time. ")
+    bible = _story_bible_brief(story_bible)
+    context_rule = (
+        "Use the story context below to keep character gender, pronouns, names, "
+        "relationships, and who-did-what consistent across lines. For Chinese 他/她/TA, "
+        "do NOT translate mechanically; infer whether the referent is he/she/they from "
+        "the character bible and local context. If uncertain, use the character name or "
+        "a neutral phrasing rather than the wrong gender.\n\n" + bible + "\n\n"
+        if bible else
+        "Keep character gender, pronouns, names, relationships, and who-did-what "
+        "consistent across lines. For Chinese 他/她/TA, infer the referent from story "
+        "context; if uncertain, use the character name or neutral phrasing.\n")
+    sys_msg = (
+        f"You are a professional video-dubbing translator. Translate each "
+        f"numbered line into natural, spoken {target}, the way a voice actor "
+        f"would say it. {context_rule}{budget_rule}Translate fully - never keep or "
+        f"transliterate the source language. Reply with ONLY a JSON object "
+        f'{{"lines": [...]}} holding exactly {len(lines)} strings, in order, '
+        f"one per input line.")
+    for temp in (1.0, 0.7, 0.4):
+        content = _deepseek_chat(
+            [{"role": "system", "content": sys_msg},
+             {"role": "user", "content": numbered}], api_key, temperature=temp)
+        if not content:
+            continue
+        try:
+            parts = json.loads(content).get("lines")
+        except Exception:
+            parts = None
+        if isinstance(parts, list) and len(parts) == len(lines):
+            return ["" if p is None else str(p) for p in parts]
+    # Still no clean reply: split and retry the halves (down to single lines).
+    if len(lines) > 1 and depth < 8:
+        mid = len(lines) // 2
+        dl = durations[:mid] if durations is not None else None
+        dr = durations[mid:] if durations is not None else None
+        return (_ds_span(lines[:mid], target, api_key, dl, depth + 1, story_bible)
+                + _ds_span(lines[mid:], target, api_key, dr, depth + 1, story_bible))
+    return [None] * len(lines)
+
+
 def _deepseek_translate(lines: list[str], lang: str, api_key: str,
-                        durations: list[float] | None = None) -> list[str] | None:
-    """Translate every line with DeepSeek. Returns a same-length list, or None if
-    a call fails or the model doesn't return exactly one translation per line.
+                        durations: list[float] | None = None,
+                        story_bible: dict | None = None) -> list[str] | None:
+    """Translate every line with DeepSeek. Returns a same-length list (a line that
+    couldn't be translated even after splitting becomes ""), or None only when the
+    whole call fails outright (e.g. bad key) so the caller can fall back.
     durations: per-line spoken-time budget (seconds). When given, each line is
     tagged with its budget and the model is told to keep the translation short
     enough to say in that time - this is what keeps the dub from drifting out of
     sync when a translation would otherwise run longer than the original line."""
-    import json as _json
     target = _LANG_NAMES.get(lang, lang)
-    out: list[str] = []
+    out: list[str | None] = []
     pos = 0
-    for chunk in _chunk(lines, 3500):
-        if durations is not None:
-            numbered = "\n".join(f"{i + 1}. ({durations[pos + i]:.1f}s) {ln}"
-                                 for i, ln in enumerate(chunk))
-            budget_rule = (
-                "Each line is prefixed with its spoken-time budget in seconds, "
-                "like (2.3s). Your translation MUST be short enough to say "
-                "naturally within that budget - tighten phrasing and cut filler "
-                "rather than overrun, while keeping the core meaning. ")
-        else:
-            numbered = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(chunk))
-            budget_rule = ("Keep each line about as short as the source so it "
-                           "fits the original speaking time. ")
+    for chunk in _chunk(lines, _DS_MAX_CHARS, _DS_MAX_LINES):
+        d = durations[pos:pos + len(chunk)] if durations is not None else None
+        out.extend(_ds_span(chunk, target, api_key, d, story_bible=story_bible))
+        pos += len(chunk)
+    if all(v is None for v in out):        # nothing came back -> let caller fall back
+        return None
+    return ["" if v is None else v for v in out]
+
+
+def cleanup_script_lines(lines: list[str], api_key: str) -> tuple[list[str], int]:
+    """Correct STT glitches before translation while preserving line count/order."""
+    key = _deepseek_key(api_key)
+    if not key or not lines:
+        return list(lines), 0
+    out = list(lines)
+    changed = 0
+    pos = 0
+    for chunk in _chunk(lines, _DS_MAX_CHARS, _DS_MAX_LINES):
+        numbered = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(chunk))
         sys_msg = (
-            f"You are a professional video-dubbing translator. Translate each "
-            f"numbered line into natural, spoken {target}, the way a voice actor "
-            f"would say it. {budget_rule}Translate fully - never keep or "
-            f"transliterate the source language. Reply with ONLY a JSON object "
-            f'{{"lines": [...]}} holding exactly {len(chunk)} strings, in order, '
-            f"one per input line.")
+            "You are a meticulous subtitle transcription editor. Fix obvious "
+            "speech-to-text mistakes, punctuation, spacing, and wrong characters "
+            "without changing meaning or language. Preserve names when uncertain. "
+            f"Reply with ONLY a JSON object {{\"lines\": [...]}} holding exactly "
+            f"{len(chunk)} strings, one per input line, in order.")
         content = _deepseek_chat(
             [{"role": "system", "content": sys_msg},
-             {"role": "user", "content": numbered}], api_key)
-        if not content:
-            return None
+             {"role": "user", "content": numbered}], key, temperature=0.2)
         try:
-            parts = _json.loads(content).get("lines")
+            fixed = json.loads(content or "{}").get("lines")
         except Exception:
-            parts = None
-        if not isinstance(parts, list) or len(parts) != len(chunk):
-            return None
-        out.extend("" if p is None else str(p) for p in parts)
+            fixed = None
+        if isinstance(fixed, list) and len(fixed) == len(chunk):
+            for j, val in enumerate(fixed):
+                text = str(val or "").strip()
+                if text and text != out[pos + j]:
+                    out[pos + j] = text
+                    changed += 1
         pos += len(chunk)
-    return out
+    return out, changed
 
 
 def translate_segments(lines: list[str], lang: str, source_lang: str = "auto",
                        api_key: str = "",
-                       durations: list[float] | None = None) -> list[str]:
+                       durations: list[float] | None = None,
+                       story_bible: dict | None = None) -> list[str]:
     """Translate lines: DeepSeek first (when a key is set), then Google, then
     MyMemory. Batched to avoid the throttling hundreds of separate requests
     trigger. A line that cannot be translated becomes "" (skipped later) - never
@@ -657,7 +1200,7 @@ def translate_segments(lines: list[str], lang: str, source_lang: str = "auto",
         return []
     key = _deepseek_key(api_key)
     if key:
-        res = _deepseek_translate(lines, lang, key, durations)
+        res = _deepseek_translate(lines, lang, key, durations, story_bible)
         if res:
             ok = _drop_untranslated(res, lang)
             if sum(1 for r in ok if r.strip()) >= len(lines) * 0.6:
@@ -723,6 +1266,81 @@ def classify_genders(orig_stats: list[dict] | None, n: int) -> list[str]:
     return out
 
 
+def ai_assign_cast(segs: list[dict], texts: list[str], api_key: str,
+                   max_speakers: int = 8,
+                   story_bible: dict | None = None) -> tuple[list[int], list[str], list[str]] | None:
+    """Ask DeepSeek to group script lines by likely character/narrator.
+
+    Audio diarization is useful, but drama recap videos often mix narrator speech with
+    short in-scene dialogue, and similar same-gender voices collapse together. This
+    text-aware pass lets the model infer "narrator", "male lead", "mother", etc. from
+    the script and assign each line a stable cast id plus a coarse gender. The returned
+    ids drive per-character voice selection; genders pick male/female voice pools.
+    """
+    key = _deepseek_key(api_key)
+    n = len(segs)
+    if not key or not n or len(texts) != n:
+        return None
+    lines = []
+    for i, s in enumerate(segs):
+        src = str(s.get("text", "")).replace("\n", " ").strip()
+        tr = str(texts[i] or "").replace("\n", " ").strip()
+        lines.append(f"{i + 1}. SRC: {src}\n   DUB: {tr}")
+    user = "\n".join(lines)
+    if len(user) > 18000:
+        # Long scripts are still handled by audio diarization; keeping this bounded
+        # avoids slow/fragile giant JSON replies.
+        return None
+    bible = _story_bible_brief(story_bible)
+    sys_msg = (
+        "You are a casting director for video dubbing. Group each numbered subtitle "
+        "line by who is speaking. Use speaker 0 for the narrator/recap voice when a "
+        "line is narration. Use speaker 1, 2, 3... for recurring on-screen characters. "
+        "Keep the same speaker id for the same character across the whole script. "
+        f"Use at most {max_speakers} speakers total. Also assign gender M or F for "
+        "the speaking role. Use the story bible to resolve Chinese 他/她/TA and avoid "
+        "flipping a character's gender. Use M for unknown narrator unless the line "
+        "clearly reads female. "
+        + (f"\n\nStory bible:\n{bible}\n\n" if bible else "")
+        + "Reply with ONLY a JSON object like "
+        '{"lines":[{"speaker":0,"gender":"M","role":"narrator"}]} with exactly one '
+        "entry per input line, in order.")
+    content = _deepseek_chat(
+        [{"role": "system", "content": sys_msg},
+         {"role": "user", "content": user}], key, temperature=0.2)
+    if not content:
+        return None
+    try:
+        arr = json.loads(content).get("lines")
+    except Exception:
+        return None
+    if not isinstance(arr, list) or len(arr) != n:
+        return None
+    labels: list[int] = []
+    genders: list[str] = []
+    roles: list[str] = []
+    remap: dict[int, int] = {}
+    for item in arr:
+        if not isinstance(item, dict):
+            return None
+        try:
+            raw = int(item.get("speaker", 0))
+        except Exception:
+            raw = 0
+        raw = max(0, min(max_speakers - 1, raw))
+        if raw not in remap:
+            remap[raw] = len(remap)
+        labels.append(remap[raw])
+        g = str(item.get("gender", "M")).upper()
+        genders.append("F" if g.startswith("F") else "M")
+        role = re.sub(r"\s+", " ", str(item.get("role", "")).strip().lower())
+        roles.append(role[:40] or f"speaker {labels[-1] + 1}")
+    if len(set(labels)) <= 1:
+        return None
+    print(f"  AI cast: {len(set(labels))} characters/narrator voices", flush=True)
+    return labels, genders, roles
+
+
 def build_scene_fx(vocals_path: str, segs: list[dict], total_ms: int,
                    pad_ms: int = 150, gain_db: float = -9.0) -> "AudioSegment":
     """Recover scene vocal SFX (panting, grunts, fight shouts) from the original
@@ -758,6 +1376,114 @@ def build_scene_fx(vocals_path: str, segs: list[dict], total_ms: int,
     return out + gain_db
 
 
+def duck_music_under_voice(music: "AudioSegment", voice: "AudioSegment",
+                           speech_duck_db: float = -16.0,
+                           gap_duck_db: float = -8.0,
+                           step_ms: int = 80) -> "AudioSegment":
+    """Return a music bed that is lower when dubbed voice is present.
+
+    Fixed ducking makes quiet gaps feel lifeless and still lets loud music mask
+    speech. This cheap envelope follows the rendered voice track in small chunks.
+    """
+    total = min(len(music), len(voice))
+    out = AudioSegment.empty()
+    floor = -42.0
+    for pos in range(0, total, step_ms):
+        m = music[pos:pos + step_ms]
+        v = voice[pos:pos + step_ms]
+        gain = speech_duck_db if (v.dBFS != float("-inf") and v.dBFS > floor) else gap_duck_db
+        out += m + gain
+    if len(music) > total:
+        out += music[total:] + gap_duck_db
+    return out
+
+
+def build_speaker_refs(vocals: str, segs: list[dict], labels: list[int],
+                       work_dir: str) -> dict[int, str]:
+    """For each detected speaker, stitch up to ~20s of THEIR isolated-voice segments
+    into one reference wav. XTTS clones from these so every speaker keeps their own
+    voice. Returns {speaker_id: ref_wav_path} (only speakers with usable audio)."""
+    refs: dict[int, str] = {}
+    try:
+        clip = AudioSegment.from_file(vocals)
+    except Exception:
+        return refs
+    buckets: dict[int, list[dict]] = {}
+    for s, lab in zip(segs, labels):
+        buckets.setdefault(lab, []).append(s)
+    for lab, items in buckets.items():
+        comb = AudioSegment.silent(duration=0)
+        for s in items:
+            comb += clip[int(s["start"] * 1000):int(s["end"] * 1000)]
+            if comb.duration_seconds >= 20:
+                break
+        if comb.duration_seconds < 1.5:        # too little to model a voice from
+            continue
+        p = os.path.join(work_dir, f"spk_{lab}.wav")
+        try:
+            comb.export(p, format="wav")
+            refs[lab] = p
+        except Exception:
+            continue
+    return refs
+
+
+# EBU R128 two-pass loudness (upgrade of the single-pass loudnorm we used at the
+# three render sites). Single-pass `loudnorm` normalises dynamically in one go, which
+# can pump or limit unevenly; measuring the finished mix first and then applying with
+# the measured stats + linear=true gives an accurate, transparent normalisation to the
+# same -14 LUFS / -1.5 dBTP target. Falls back to single-pass automatically when the
+# measure pass fails, and can be forced off with env DUB_SINGLEPASS_LOUDNORM=1.
+_LN_I, _LN_TP, _LN_LRA = -14.0, -1.5, 11.0
+
+
+def _loudnorm_single(I: float = _LN_I, TP: float = _LN_TP, LRA: float = _LN_LRA) -> str:
+    return f"loudnorm=I={I}:TP={TP}:LRA={LRA}"
+
+
+def _measure_loudnorm(ffmpeg: str, wav: str, I: float = _LN_I, TP: float = _LN_TP,
+                      LRA: float = _LN_LRA) -> dict | None:
+    """First pass: measure `wav`'s integrated loudness/true-peak/range via
+    loudnorm:print_format=json. Returns the measured_* inputs, or None on ANY failure
+    (missing file, non-zero rc, timeout, unparseable output) so the caller falls back
+    to a plain single-pass filter. Skipped entirely if DUB_SINGLEPASS_LOUDNORM=1."""
+    if os.environ.get("DUB_SINGLEPASS_LOUDNORM", "") == "1":
+        return None
+    if not wav or not os.path.exists(wav):
+        return None
+    filt = f"loudnorm=I={I}:TP={TP}:LRA={LRA}:print_format=json"
+    try:
+        p = subprocess.run([ffmpeg, "-hide_banner", "-nostats", "-i", wav,
+                            "-af", filt, "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=600)
+    except Exception:
+        return None
+    err = p.stderr or ""
+    i, j = err.rfind("{"), err.rfind("}")        # JSON block is printed last on stderr
+    if i < 0 or j <= i:
+        return None
+    try:
+        m = json.loads(err[i:j + 1])
+        return {k: m[k] for k in ("input_i", "input_tp", "input_lra",
+                                  "input_thresh", "target_offset")}
+    except Exception:
+        return None
+
+
+def _loudnorm_filter(ffmpeg: str, wav: str, I: float = _LN_I, TP: float = _LN_TP,
+                     LRA: float = _LN_LRA) -> str:
+    """The loudnorm filter string to apply to `wav`: a measured, linear two-pass
+    filter when the measure pass succeeds, else the plain single-pass filter."""
+    m = _measure_loudnorm(ffmpeg, wav, I, TP, LRA)
+    if not m:
+        return _loudnorm_single(I, TP, LRA)
+    print("  loudness: two-pass (measured) normalisation", flush=True)
+    return (f"loudnorm=I={I}:TP={TP}:LRA={LRA}:"
+            f"measured_I={m['input_i']}:measured_TP={m['input_tp']}:"
+            f"measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}:"
+            f"offset={m['target_offset']}:linear=true")
+
+
 def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
              video: str, out_dir: str, base: str, work: str, ffmpeg: str,
              source_lang: str = "auto", cover_subs: bool = False, subs_band: int = 18,
@@ -767,19 +1493,99 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
              median_dbfs: float | None = None, audio_only: bool = False,
              clone: bool = False, vocals: str | None = None,
              api_key: str = "", gender_mode: bool = False,
-             scene_fx: bool = False) -> None:
+             scene_fx: bool = False, spk_labels: list[int] | None = None,
+             texts_override: list[str] | None = None,
+             length_fit: bool = False, cast_mode: bool = False,
+             script_cleanup: bool = False, preset: str = "",
+             rights_mode: str = "", voice_duck: bool = False,
+             cast_roles: list[str] | None = None,
+             cast_genders: list[str] | None = None,
+             story_bible: dict | None = None) -> None:
     if naming != "firstline":
         out_mp4 = os.path.join(out_dir, f"{base}_{lang}.mp4")
         if os.path.exists(out_mp4):
             print(f"  [{lang}] already done; skipping")
             return
 
-    print(f"__STAGE__ {lang.upper()}: translating", flush=True)
-    # Budget each translation to the original line's spoken time so DeepSeek keeps
-    # it short enough to stay in sync (floor avoids an impossible budget on blips).
-    durations = [max(0.6, s["end"] - s["start"]) for s in segs]
-    texts = translate_segments([s["text"] for s in segs], lang, source_lang,
-                               api_key, durations)
+    # Re-dub path: the editor passes the human-edited translations, so skip the
+    # translator entirely and voice exactly what the user approved.
+    if texts_override is not None and len(texts_override) == len(segs):
+        texts = list(texts_override)
+        print(f"__STAGE__ {lang.upper()}: using edited script", flush=True)
+    else:
+        print(f"__STAGE__ {lang.upper()}: translating", flush=True)
+        src_lines = [s["text"] for s in segs]
+        if script_cleanup:
+            print(f"__STAGE__ {lang.upper()}: cleaning script", flush=True)
+            cleaned, nclean = cleanup_script_lines(src_lines, api_key)
+            if nclean:
+                print(f"  script cleanup adjusted {nclean}/{len(src_lines)} lines", flush=True)
+                src_lines = cleaned
+                for s, txt in zip(segs, cleaned):
+                    s["text"] = txt
+        # Budget each translation to the original line's spoken time so DeepSeek keeps
+        # it short enough to stay in sync (floor avoids an impossible budget on blips).
+        durations = [max(0.6, s["end"] - s["start"]) for s in segs]
+        if story_bible is None and _deepseek_key(api_key):
+            bible_sig = hashlib.sha1(json.dumps(src_lines, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+            bible_path = os.path.join(work, "analysis", f"{base}_{bible_sig}_story.json")
+            if os.path.exists(bible_path):
+                try:
+                    story_bible = json.load(open(bible_path, encoding="utf-8"))
+                    print("  story context: reused cached character bible", flush=True)
+                except Exception:
+                    story_bible = None
+            if story_bible is None:
+                print(f"__STAGE__ {lang.upper()}: understanding story", flush=True)
+                story_bible = build_story_bible(src_lines, api_key)
+                if story_bible:
+                    try:
+                        json.dump(story_bible, open(bible_path, "w", encoding="utf-8"),
+                                  ensure_ascii=False)
+                    except Exception:
+                        pass
+                    print(f"  story context: {len(story_bible.get('characters') or [])} characters", flush=True)
+        tr_sig = hashlib.sha1(json.dumps(
+            {"v": 2, "lang": lang, "src": src_lines,
+             "story": story_bible or {},
+             "dur": [round(d, 2) for d in durations]},
+            ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+        tr_cache = os.path.join(work, "analysis", f"{base}_{lang}_{tr_sig}_tr.json")
+        texts = None
+        if os.path.exists(tr_cache):
+            try:
+                cached_tr = json.load(open(tr_cache, encoding="utf-8")).get("texts")
+                if isinstance(cached_tr, list) and len(cached_tr) == len(src_lines):
+                    texts = [str(x or "") for x in cached_tr]
+                    print(f"  [{lang}] reused cached translation", flush=True)
+            except Exception:
+                texts = None
+        if texts is None:
+            texts = translate_segments(src_lines, lang, source_lang, api_key, durations, story_bible)
+            try:
+                os.makedirs(os.path.dirname(tr_cache), exist_ok=True)
+                json.dump({"texts": texts}, open(tr_cache, "w", encoding="utf-8"),
+                          ensure_ascii=False)
+            except Exception:
+                pass
+        # Optional second-pass length-fit (OmniVoice speech_rate port): dub.py already
+        # hands DeepSeek each line's time budget during translation, but the model
+        # doesn't always obey. This pass estimates each translated line's reading time
+        # from a per-language chars/sec table and asks DeepSeek to trim/expand ONLY the
+        # lines that still overshoot/undershoot their slot - so the audio fit step below
+        # has to time-stretch far less. Needs a DeepSeek key; a no-op without one. Not
+        # run on the re-dub path (texts_override) - the user already approved those.
+        if length_fit:
+            key = _deepseek_key(api_key)
+            if key:
+                import speech_rate
+                slots = [max(0.6, s["end"] - s["start"]) for s in segs]
+                srcs = [s.get("text", "") for s in segs]
+                print(f"__STAGE__ {lang.upper()}: fitting length", flush=True)
+                texts, nfit = speech_rate.fit_texts_counted(
+                    texts, slots, lang, _deepseek_chat_fn(key), srcs)
+                print(f"  [{lang}] length-fit adjusted {nfit}/{len(texts)} lines",
+                      flush=True)
     print("__PCT__ 12", flush=True)
 
     if naming == "firstline":
@@ -791,32 +1597,88 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
 
     seg_dir = os.path.join(work, f"tts_{base}_{lang}")
     os.makedirs(seg_dir, exist_ok=True)
-    jobs = [(texts[i], os.path.join(seg_dir, f"{i:03d}")) for i in range(len(texts))]
+    jobs = [(texts[i], _seg_base(seg_dir, i, texts[i])) for i in range(len(texts))]
     seg_voices = None
     genders = None
-    if gender_mode and lang in GENDER_VOICES:
+    # Multi-speaker: spk_labels (computed once per video by run_one's diarize_once
+    # and reused across languages) groups the lines by who's talking, so each
+    # speaker gets a distinct voice (and, with cloning, their OWN voice). None when
+    # there's a single speaker or diarization was unavailable.
+    spk_refs = None
+    # Classify M/F from the original pitch whenever gender mode is on - even when
+    # speakers were also split. Previously this lived in an `elif`, so detecting
+    # speakers silently disabled the gender choice; now the two combine (and `genders`
+    # is also handed to XTTS / the pitch step below).
+    ai_genders = None
+    ai_roles = None
+    if cast_mode:
+        cast_sig = hashlib.sha1(json.dumps(
+            [[s.get("start"), s.get("end"), s.get("text"), texts[i] if i < len(texts) else ""]
+             for i, s in enumerate(segs)],
+            ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+        cast_path = os.path.join(seg_dir, f"_cast_{cast_sig}.json")
+        cast = None
+        if os.path.exists(cast_path):
+            try:
+                c = json.load(open(cast_path, encoding="utf-8"))
+                cast = (c["labels"], c["genders"], c["roles"])
+                print("  AI cast: reused cached character assignment", flush=True)
+            except Exception:
+                cast = None
+        if cast is None:
+            cast = ai_assign_cast(segs, texts, api_key, story_bible=story_bible)
+            if cast:
+                try:
+                    json.dump({"labels": cast[0], "genders": cast[1], "roles": cast[2]},
+                              open(cast_path, "w", encoding="utf-8"), ensure_ascii=False)
+                except Exception:
+                    pass
+        if cast:
+            spk_labels, ai_genders, ai_roles = cast
+    if ai_genders is not None:
+        genders = ai_genders
+        cast_genders = ai_genders
+        cast_roles = ai_roles
+    elif gender_mode:
         genders = classify_genders(orig_stats, len(jobs))
+        cast_genders = genders
+    if spk_labels is not None:
+        if genders is not None:
+            seg_voices = _speaker_gender_voices(lang, spk_labels, genders)
+            nm = sum(1 for g in genders if g == "M")
+            print(f"  [{lang}] {len(set(spk_labels))} speakers, gender-matched "
+                  f"({nm} male / {len(genders) - nm} female lines)", flush=True)
+        else:
+            pool = _speaker_voices(lang)
+            seg_voices = [pool[spk_labels[i] % len(pool)] for i in range(len(jobs))]
+    elif genders is not None and lang in GENDER_VOICES:
         seg_voices = [GENDER_VOICES[lang][g] for g in genders]
         nm = sum(1 for g in genders if g == "M")
         print(f"  [{lang}] gender voices: {nm} male / {len(genders) - nm} female lines", flush=True)
     print(f"__STAGE__ {lang.upper()}: voicing", flush=True)
-    # English: prefer XTTS v2 (local, natural, and clones the original speaker from
-    # the vocals stem when one is present). It supersedes Piper AND the OpenVoice
-    # clone step for en; when coqui-tts / the model aren't installed available() is
-    # False and we fall back to the normal Piper/edge-tts path. Other languages
-    # (ms/id/vi/es) are unchanged - XTTS doesn't support them.
+    # XTTS-supported languages: prefer XTTS v2 (local, natural, and clones the
+    # original speaker from the vocals stem when one is present). It supersedes Piper
+    # AND the OpenVoice clone step; when coqui-tts / the model aren't installed
+    # available() is False and we fall back to the normal Piper/edge-tts path.
+    # Languages XTTS can't model (vi/id/ms) stay on edge-tts. See xtts.XTTS_LANGS.
     import xtts
-    use_xtts = lang == "en" and xtts.available()
+    force_edge_voices = bool(seg_voices) or (not clone and lang in VOICES)
+    use_xtts = (not force_edge_voices) and lang in xtts.XTTS_LANGS and xtts.available()
     if use_xtts:
-        # Clone the original speaker ONLY when the user explicitly ticked "clone".
-        # Cloning a Chinese source voice into English adds a heavy accent that wrecks
-        # clarity, and `vocals` can exist for unrelated reasons (gender / scene-fx /
-        # keep-music all run Demucs), so we must NOT clone by default - use XTTS's
-        # clean built-in English speaker instead.
-        paths = xtts.synthesize(jobs, vocals if clone else None, genders)
+        # With multi-speaker + clone, give XTTS one reference per speaker so each is
+        # voiced in their OWN voice; without clone, XTTS assigns a distinct built-in
+        # speaker per id. Otherwise: clone the single original (only when ticked), or
+        # use the gender/built-in path. `vocals` can exist for unrelated reasons
+        # (gender / scene-fx / keep-music all run Demucs), so we never clone by default.
+        if spk_labels is not None and clone and vocals:
+            spk_refs = build_speaker_refs(vocals, segs, spk_labels, seg_dir)
+        paths = xtts.synthesize(jobs, vocals if (clone and spk_labels is None) else None,
+                                genders, lang, spk_labels=spk_labels, spk_refs=spk_refs)
     else:
         paths = tts_all(jobs, lang, seg_voices)
-    if clone and vocals and not use_xtts:
+    if clone and vocals and not use_xtts and spk_labels is None:
+        # (OpenVoice clones to ONE reference, which would collapse multi-speaker voices
+        # back into a single voice, so we skip it when speakers were split.)
         print(f"__STAGE__ {lang.upper()}: cloning original voice", flush=True)
         import voiceclone
         paths = voiceclone.clone_segments(paths, vocals, seg_dir, lang, ffmpeg)
@@ -832,7 +1694,9 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
             continue
         orig_start = int(s["start"] * 1000)
-        start = max(orig_start, cursor)                       # never overlap the last line
+        # Keep the dub close to the source timing. An over-long translation can
+        # push following lines only a little; otherwise the whole clip drifts late.
+        start = max(orig_start, min(cursor, orig_start + MAX_SYNC_DRIFT_MS))
         nxt = int(segs[i + 1]["start"] * 1000) if i + 1 < len(segs) else total_ms
         room = max(300, nxt - start)                          # time left before the next line
         fit_wav = os.path.join(seg_dir, f"{i:03d}_fit.wav")
@@ -842,7 +1706,7 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
             # speech into the "can't understand it" mush, so for XTTS we do neither:
             # no pitch shift, only a mild speed-up, and let the timeline drift and
             # recover at the next pause instead of cramming every line into its slot.
-            seg_audio = fit_segment(path, fit_wav, room, ffmpeg, max_tempo=1.25)
+            seg_audio = fit_segment(path, fit_wav, room, ffmpeg, max_tempo=1.15)
         elif tone == "original":
             st = orig_stats[i] if (orig_stats and i < len(orig_stats)) else None
             f0 = st.get("f0") if st else None
@@ -864,7 +1728,13 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         music = AudioSegment.from_file(bed)
         if len(music) < total_ms:
             music = music + AudioSegment.silent(total_ms - len(music))
-        music = music[:total_ms] - 6
+        # Duck the kept music a little more (was -6 dB): loud beds were masking the
+        # dub and making the new voice hard to follow.
+        music = music[:total_ms]
+        if voice_duck:
+            music = duck_music_under_voice(music, voice_track)
+        else:
+            music = music - 12
         mixed = music.overlay(voice_track)
     else:
         mixed = voice_track
@@ -875,6 +1745,9 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
 
     mix_wav = os.path.join(work, f"{base}_{lang}_mix.wav")
     mixed.export(mix_wav, format="wav")
+    # Measure the finished mix once and reuse the (two-pass) loudnorm filter at
+    # whichever render site runs below - auto-falls back to single-pass on failure.
+    ln = _loudnorm_filter(ffmpeg, mix_wav)
 
     if audio_only:
         # Audio-only mode: skip the video render, save just the dubbed audio
@@ -882,11 +1755,21 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         out_audio = os.path.splitext(out_mp4)[0] + ".wav"
         print(f"__STAGE__ {lang.upper()}: exporting audio", flush=True)
         subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", mix_wav,
-                        "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", out_audio])
+                        "-af", ln, out_audio])
         print("__PCT__ 100", flush=True)
         ok = os.path.exists(out_audio)
         print(f"  [{lang}] -> dubbed\\{os.path.basename(out_audio)}"
               + ("" if ok else "   (FAILED)"))
+        if ok:
+            # Machine-readable: lets the GUI pair this dub with its source for A/B preview.
+            print(f"__OUT__\t{os.path.abspath(video)}\t{os.path.abspath(out_audio)}", flush=True)
+            write_project(os.path.splitext(out_audio)[0] + ".dubproj.json", base=base,
+                          source=video, output=out_audio, audio_only=True,
+                          src_lang=source_lang, lang=lang, segs=segs, texts=texts,
+                          spk_labels=spk_labels, seg_voices=seg_voices,
+                          cast_roles=cast_roles, cast_genders=cast_genders,
+                          preset=preset, rights_mode=rights_mode,
+                          story_bible=story_bible)
         return
 
     print("__PCT__ 88", flush=True)
@@ -929,35 +1812,165 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
     if vchain or burn_subs:
         # force even width/height - libx264 rejects odd dimensions and writes a 0-byte file
         vchain += f"{label}scale=trunc(iw/2)*2:trunc(ih/2)*2{burn_filter}[vout];"
-        fc = vchain + "[1:a]loudnorm=I=-14:TP=-1.5:LRA=11[outa]"
+        fc = vchain + f"[1:a]{ln}[outa]"
         cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "[outa]",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", out_mp4]
         subprocess.run(cmd, cwd=work)
     else:
         cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
-                "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-shortest", out_mp4]
+                "-af", ln, "-shortest", out_mp4]
         subprocess.run(cmd)
     print("__PCT__ 100", flush=True)
     ok = os.path.exists(out_mp4)
     print(f"  [{lang}] -> dubbed\\{base}_{lang}.mp4" + ("" if ok else "   (FAILED)"))
+    if ok:
+        # Machine-readable: lets the GUI pair this dub with its source for A/B preview.
+        print(f"__OUT__\t{os.path.abspath(video)}\t{os.path.abspath(out_mp4)}", flush=True)
+        write_project(os.path.splitext(out_mp4)[0] + ".dubproj.json", base=base,
+                      source=video, output=out_mp4, audio_only=False,
+                      src_lang=source_lang, lang=lang, segs=segs, texts=texts,
+                      spk_labels=spk_labels, seg_voices=seg_voices,
+                      cast_roles=cast_roles, cast_genders=cast_genders,
+                      preset=preset, rights_mode=rights_mode,
+                      story_bible=story_bible)
+
+
+# ---------------------------------------------------------------------------
+# Per-video analysis cache. Transcription (Whisper), the original-voice
+# pitch/loudness stats, and speaker diarization are all INDEPENDENT of the
+# target language - only translation + TTS + mux change per language. Caching
+# them in a JSON sidecar lets a later run dub the SAME video into a DIFFERENT
+# language without re-running Whisper/diarization (the slow steps). Demucs output
+# is already reused on disk by ensure_bed(). The cache is keyed by the video's
+# size+mtime and the Whisper model size, so editing the video or switching to a
+# bigger model transparently invalidates it and forces a fresh transcription.
+# ---------------------------------------------------------------------------
+_CACHE_VERSION = 4        # bumped: Facebook Reels preset analysis/cache metadata
+
+
+def _analysis_cache_path(work: str, base: str) -> str:
+    d = os.path.join(work, "analysis")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{base}.json")
+
+
+def _video_sig(video: str) -> dict:
+    """Cheap fingerprint of the source video so an edited/replaced file with the
+    same name doesn't reuse a stale transcription."""
+    try:
+        st = os.stat(video)
+        return {"size": st.st_size, "mtime": int(st.st_mtime)}
+    except OSError:
+        return {}
+
+
+def load_analysis(work: str, base: str, video: str, model_size: str,
+                  analysis_key: str = "default") -> dict | None:
+    """Return the cached analysis for this video, or None when absent/stale."""
+    p = _analysis_cache_path(work, base)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if data.get("version") != _CACHE_VERSION:
+        return None
+    if data.get("sig") != _video_sig(video):
+        return None
+    if data.get("model") != model_size:        # a different model -> re-transcribe
+        return None
+    if data.get("analysis_key", "default") != analysis_key:
+        return None
+    if not data.get("segs"):
+        return None
+    return data
+
+
+def save_analysis(work: str, base: str, video: str, model_size: str, total_ms: int,
+                  src_lang: str, segs: list[dict], orig_stats: list[dict] | None,
+                  median_dbfs: float | None, spk_labels: list[int] | None,
+                  analysis_key: str = "default", alt_meta: dict | None = None,
+                  rights_mode: str = "", cast_roles: list[str] | None = None,
+                  cast_genders: list[str] | None = None) -> None:
+    """Persist the language-independent analysis next to the work files. Best
+    effort - a write failure never aborts the dub."""
+    data = {
+        "version": _CACHE_VERSION,
+        "sig": _video_sig(video),
+        "model": model_size,
+        "analysis_key": analysis_key,
+        "total_ms": total_ms,
+        "src_lang": src_lang,
+        "segs": segs,
+        "alt_meta": alt_meta or {},
+        "orig_stats": orig_stats,
+        "median_dbfs": median_dbfs,
+        "spk_labels": spk_labels,
+        "cast_roles": cast_roles,
+        "cast_genders": cast_genders,
+        "rights_mode": rights_mode,
+    }
+    try:
+        with open(_analysis_cache_path(work, base), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"  (could not cache analysis: {str(e)[:50]})", flush=True)
+
+
+def diarize_once(vocals: str | None, segs: list[dict]) -> list[int] | None:
+    """Run speaker diarization once for the video (language-independent). Returns
+    per-segment speaker labels, or None when there's one speaker / it's
+    unavailable. Logged once here so make_dub() can reuse the result per language."""
+    if not vocals:
+        return None
+    labels = None
+    try:
+        import speakers
+        if speakers.available():
+            labels = speakers.diarize(vocals, segs)
+    except Exception as e:
+        print(f"  speaker split unavailable ({str(e)[:50]}); using one voice.", flush=True)
+    if labels and len(set(labels)) > 1:
+        print(f"  {len(set(labels))} speakers detected", flush=True)
+        return labels
+    return None        # only one speaker - nothing to split
 
 
 def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
             subs_band, cover_region, fb_vertical, make_srt, naming, burn_subs=False,
             tone="natural", audio_only=False, clone=False, api_key="",
-            gender_mode=False, scene_fx=False):
+            gender_mode=False, scene_fx=False, speakers_mode=False,
+            model_size="medium", reuse_analysis=True, texts_override=None,
+            length_fit=False, preset: str = "", rights_mode: str = ""):
     video = os.path.abspath(video)
     base = os.path.splitext(os.path.basename(video))[0]
+    facebook_reels = preset == "facebook_reels"
+    if facebook_reels:
+        fb_vertical = True
+        burn_subs = True
+        make_srt = True
+        cover_subs = True
+        length_fit = True
+        speakers_mode = True
+        gender_mode = True
+        clone = False
+        rights_mode = rights_mode or "owned_or_licensed"
+        print("  preset: Facebook Reels Auto (owned/licensed source)", flush=True)
     print(f"> {base}: dubbing -> {', '.join(langs)}", flush=True)
     bed, vocals = None, None
     # Gender mode judges male/female from the speaker's pitch, which is only
     # reliable on the isolated voice - so it needs Demucs too, not just the
     # music-keeping/cloning paths. (bed is dropped below unless keepmusic.)
-    if keepmusic or clone or scene_fx or gender_mode:
+    if keepmusic or clone or scene_fx or gender_mode or speakers_mode:
         bed, vocals = ensure_bed(video, base, work, ffmpeg)
     if not keepmusic:
         bed = None
+    if clone and speakers_mode:
+        print("  [clone] disabled for character voices; using separate cast voices.", flush=True)
+        clone = False
     if clone:
         import voiceclone
         if not voiceclone.available():
@@ -967,22 +1980,58 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
             print("  [clone] couldn't isolate the original voice; using normal voice.", flush=True)
             clone = False
     total_ms = int(ffprobe_duration(video, ffmpeg) * 1000)
-    segs, src_lang = transcribe(model, vocals if vocals else video, total_ms)
+
+    # Reuse the language-independent analysis (transcription / voice stats /
+    # speaker split) from a previous run on this same video, so dubbing it into a
+    # NEW language skips Whisper + diarization and goes straight to translate+TTS.
+    analysis_key = ("facebook_reels_v2_story" if facebook_reels else "default")
+    cached = load_analysis(work, base, video, model_size, analysis_key) if reuse_analysis else None
+    if cached:
+        segs = cached["segs"]
+        src_lang = cached["src_lang"]
+        total_ms = cached.get("total_ms", total_ms)
+        orig_stats = cached.get("orig_stats")
+        median_dbfs = cached.get("median_dbfs")
+        spk_labels = cached.get("spk_labels")
+        alt_meta = cached.get("alt_meta") or {}
+        print(f"  reusing cached analysis: {len(segs)} segments, source "
+              f"{src_lang} (skipping transcription)", flush=True)
+    else:
+        segs, src_lang, alt_meta = transcribe_for_dub(
+            model, video, vocals, total_ms, dual_pass=facebook_reels)
+        orig_stats, median_dbfs, spk_labels = None, None, None
     if not segs:
         print("  no speech detected; skipping.", flush=True)
         return
-    orig_stats, median_dbfs = None, None
-    if tone == "original" or gender_mode:
+
+    # Compute (or back-fill) the original-voice stats when this run needs them and
+    # the cache didn't already have them (e.g. first run was tone=natural).
+    if (tone == "original" or gender_mode) and orig_stats is None:
         orig = load_orig_audio(video, vocals, work, base, ffmpeg)
         if orig is not None:
             orig_stats, median_dbfs = compute_orig_stats(orig, segs)
         else:
             print("  tone=original: original audio unavailable; matching pace only.", flush=True)
+
+    # Diarize once for the whole video (not per language) and back-fill the cache.
+    if speakers_mode and vocals and spk_labels is None:
+        spk_labels = diarize_once(vocals, segs)
+
+    save_analysis(work, base, video, model_size, total_ms, src_lang, segs,
+                  orig_stats, median_dbfs, spk_labels,
+                  analysis_key=analysis_key, alt_meta=alt_meta,
+                  rights_mode=rights_mode)
+
     for lang in langs:
         make_dub(lang, segs, total_ms, bed, video, out_dir, base, work, ffmpeg, src_lang,
                  cover_subs, subs_band, cover_region, fb_vertical, make_srt, naming, burn_subs,
                  tone, orig_stats, median_dbfs, audio_only, clone, vocals, api_key, gender_mode,
-                 scene_fx)
+                 scene_fx, spk_labels if speakers_mode else None,
+                 texts_override=(texts_override or {}).get(lang),
+                 length_fit=length_fit, cast_mode=speakers_mode,
+                 script_cleanup=facebook_reels, preset=preset,
+                 rights_mode=rights_mode,
+                 voice_duck=facebook_reels and bool(bed))
 
 
 def _setup(ffmpeg, out_dir, work):
@@ -1000,10 +2049,10 @@ def _setup(ffmpeg, out_dir, work):
 def main() -> None:
     # Batch mode: one process, model loaded once, many videos.
     if len(sys.argv) > 2 and sys.argv[1] == "--jobs":
-        import json
         with open(sys.argv[2], encoding="utf-8") as f:
             cfg = json.load(f)
         ffmpeg, out_dir, work = _setup(cfg["ffmpeg"], cfg["out"], cfg["work"])
+        model_size = cfg.get("model", "medium")
         langs = [x.strip() for x in cfg["langs"].split(",") if x.strip() in VOICES]
         # GUI voice picker: each ticked language carries the chosen edge-tts voice.
         # Apply it (and drop Piper for that language) so the picked voice is what plays.
@@ -1013,7 +2062,9 @@ def main() -> None:
                 PIPER_VOICES.pop(lg, None)
         videos = cfg["videos"]
         tone = cfg.get("tone", "original")
-        model = WhisperModel(cfg.get("model", "small"), device="cpu", compute_type="int8")
+        preset = cfg.get("preset", "")
+        rights_mode = cfg.get("rights_mode", "")
+        model = WhisperModel(cfg.get("model", "medium"), device="cpu", compute_type="int8")
         for i, item in enumerate(videos, 1):
             if isinstance(item, str):
                 video, region = item, cfg.get("region", "")
@@ -1027,7 +2078,13 @@ def main() -> None:
                         cfg.get("srt", False), cfg.get("naming", "source"),
                         cfg.get("burn", False), tone, cfg.get("audioonly", False),
                         cfg.get("clone", False), cfg.get("deepseek_key", ""),
-                        cfg.get("gender", False), cfg.get("scenefx", False))
+                        cfg.get("gender", False), cfg.get("scenefx", False),
+                        cfg.get("speakers", False), model_size,
+                        cfg.get("reuse_analysis", True),
+                        cfg.get("texts_override"),
+                        cfg.get("length_fit", False),
+                        cfg.get("preset", preset),
+                        cfg.get("rights_mode", rights_mode))
             except Exception as e:
                 print(f"  ERROR on {os.path.basename(video)}: {e}", flush=True)
             print(f"__FILEDONE__ {i}", flush=True)
@@ -1037,7 +2094,7 @@ def main() -> None:
     video = sys.argv[1]
     ffmpeg, out_dir, work = _setup(sys.argv[3], sys.argv[2], sys.argv[4])
     langs = [x.strip() for x in sys.argv[5].split(",") if x.strip() in VOICES]
-    model_size = sys.argv[6] if len(sys.argv) > 6 else "small"
+    model_size = sys.argv[6] if len(sys.argv) > 6 else "medium"
     keep_music = len(sys.argv) > 7 and sys.argv[7] == "1"
     cover_subs = len(sys.argv) > 8 and sys.argv[8] == "1"
     subs_band = int(sys.argv[9]) if len(sys.argv) > 9 else 18
@@ -1050,7 +2107,8 @@ def main() -> None:
     audio_only = len(sys.argv) > 16 and sys.argv[16] == "1"
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
     run_one(model, video, out_dir, ffmpeg, work, langs, keep_music, cover_subs,
-            subs_band, cover_region, fb_vertical, make_srt, naming, burn, tone, audio_only)
+            subs_band, cover_region, fb_vertical, make_srt, naming, burn, tone, audio_only,
+            model_size=model_size)
 
 
 if __name__ == "__main__":

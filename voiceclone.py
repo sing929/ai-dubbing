@@ -70,6 +70,33 @@ def _target(reference_wav, converter):
     return _target_se[key]
 
 
+def _source(seg_paths, work_dir, lang, converter):
+    """Embedding of the synthesized (edge-tts/Piper) voice, computed once per language.
+
+    Built from a concatenation of the dubbed segments rather than a single one:
+    OpenVoice's VAD-based extractor needs >~5s of speech (split_seconds=10), and
+    individual subtitle segments are usually 2-5s, which would all fail with
+    'input audio is too short'. The synth voice is identical across a language, so
+    one combined reference gives a stable source embedding for every segment.
+    """
+    if lang in _source_se:
+        return _source_se[lang]
+    from pydub import AudioSegment
+    combined = AudioSegment.silent(duration=0)
+    for p in seg_paths:
+        if p and os.path.exists(p):
+            try:
+                combined += AudioSegment.from_file(p)
+            except Exception:
+                continue
+            if combined.duration_seconds >= 30:   # plenty for a stable embedding
+                break
+    ref = os.path.join(work_dir, f"src_ref_{lang}.wav")
+    combined.export(ref, format="wav")
+    _source_se[lang] = _get_se(ref, converter)
+    return _source_se[lang]
+
+
 def clone_segments(seg_paths, reference_wav, work_dir, lang, ffmpeg=None):
     """Convert each dubbed segment to the original speaker's voice.
 
@@ -87,6 +114,13 @@ def clone_segments(seg_paths, reference_wav, work_dir, lang, ffmpeg=None):
         return seg_paths
     if tgt is None:
         return seg_paths
+    try:
+        src = _source(seg_paths, work_dir, lang, converter)
+    except Exception as e:
+        print(f"  [clone] couldn't model the dubbed voice ({str(e)[:60]}); skipped.", flush=True)
+        return seg_paths
+    if src is None:
+        return seg_paths
 
     out = []
     for idx, p in enumerate(seg_paths):
@@ -94,12 +128,8 @@ def clone_segments(seg_paths, reference_wav, work_dir, lang, ffmpeg=None):
             out.append(p)
             continue
         try:
-            # The edge-tts base voice is identical across a language, so compute the
-            # source embedding once from the first real segment and reuse it.
-            if lang not in _source_se:
-                _source_se[lang] = _get_se(p, converter)
             dst = os.path.join(work_dir, f"clone_{idx:03d}.wav")
-            converter.convert(audio_src_path=p, src_se=_source_se[lang], tgt_se=tgt,
+            converter.convert(audio_src_path=p, src_se=src, tgt_se=tgt,
                               output_path=dst, message="@dub")
             out.append(dst if os.path.exists(dst) else p)
         except Exception as e:

@@ -25,6 +25,12 @@ import re
 # on an interactive stdin prompt (we run head-less from the GUI / .bat).
 os.environ.setdefault("COQUI_TOS_AGREED", "1")
 
+# Force transformers (pulled in by coqui-tts) onto the torch backend only. A broken
+# TensorFlow 2.15 in this machine's user site-packages can't load under NumPy 2.x, and
+# transformers auto-imports any TF it detects - crashing the XTTS import. We never use
+# TF here, so disable its detection. Must be set before transformers is first imported.
+os.environ.setdefault("USE_TF", "0")
+
 MODEL = os.environ.get("XTTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
 # Built-in studio speaker used when no original-voice reference is available.
 DEFAULT_SPEAKER = os.environ.get("XTTS_SPEAKER", "Claribel Dervla")
@@ -32,6 +38,20 @@ DEFAULT_SPEAKER = os.environ.get("XTTS_SPEAKER", "Claribel Dervla")
 # pitch gap (measured F0 ~90 Hz vs ~240 Hz) so the two genders sound clearly apart.
 MALE_SPEAKER = os.environ.get("XTTS_MALE_SPEAKER", "Damien Black")
 FEMALE_SPEAKER = os.environ.get("XTTS_FEMALE_SPEAKER", "Daisy Studious")
+
+# The 17 languages XTTS v2 can speak, mapping the app's language code -> the code
+# XTTS expects at inference (identical except Chinese: app "zh-CN" -> XTTS "zh-cn").
+# dub.py gates on `lang in XTTS_LANGS`; anything not here stays on edge-tts/Piper.
+XTTS_LANGS = {
+    "en": "en", "es": "es", "fr": "fr", "de": "de", "it": "it", "pt": "pt",
+    "pl": "pl", "tr": "tr", "ru": "ru", "nl": "nl", "cs": "cs", "ar": "ar",
+    "zh-CN": "zh-cn", "hu": "hu", "ko": "ko", "ja": "ja", "hi": "hi",
+}
+
+# Distinct built-in studio speakers handed to detected speakers in multi-speaker mode
+# when we're NOT cloning each one. Female/male interleaved so neighbours sound apart.
+SPEAKER_POOL = ["Daisy Studious", "Damien Black", "Gracie Wise", "Andrew Chipper",
+                "Tanja Adelina", "Viktor Eka", "Alison Dietlinde", "Craig Gutsy"]
 
 _state = {"tried": False, "model": None, "sr": 24000}
 _cond_cache: dict = {}   # reference wav path (or "<default>") -> (gpt_cond_latent, speaker_embedding)
@@ -88,15 +108,20 @@ def _conditioning(model, reference_wav=None, speaker=None):
     return gpt, spk
 
 
-def synthesize(jobs, reference_wav=None, genders=None):
-    """Voice each English segment with XTTS. jobs: list of (text, base_path_no_ext).
+def synthesize(jobs, reference_wav=None, genders=None, lang="en",
+               spk_labels=None, spk_refs=None):
+    """Voice each segment with XTTS in language `lang` (an XTTS_LANGS key).
+    jobs: list of (text, base_path_no_ext).
     reference_wav: when set, clone this voice for every line (the original speaker).
     genders: optional list of "M"/"F" per job - when given AND not cloning, each line
-    is voiced with a distinct male / female built-in speaker so the original speakers'
-    genders stay clearly apart. Returns a per-job .wav path, or None when a segment has
-    no speakable text or synthesis fails (caller skips None, exactly like tts_all).
-    Never raises - a hard failure is caught by available() upstream, which falls back
-    to Piper for the whole language."""
+    is voiced with a distinct male / female built-in speaker.
+    spk_labels: optional per-job speaker id (multi-speaker mode). Each speaker is voiced
+    with their OWN cloned voice when spk_refs has a reference for them, else a distinct
+    built-in studio speaker from SPEAKER_POOL. Takes priority over genders.
+    spk_refs: {speaker_id: reference_wav} for per-speaker cloning.
+    Returns a per-job .wav path, or None when a segment has no speakable text or
+    synthesis fails (caller skips None). Never raises - a hard failure is caught by
+    available() upstream, which falls back to Piper for the whole language."""
     n = len(jobs)
     model = _load()
     if model is None:
@@ -107,11 +132,13 @@ def synthesize(jobs, reference_wav=None, genders=None):
     except Exception as e:
         print(f"  [xtts] audio libs missing ({str(e)[:50]}); using normal voice.", flush=True)
         return [None] * n
+    labels = spk_labels if (spk_labels and len(spk_labels) == n) else None
+    spk_refs = spk_refs or {}
     # Per-line male/female voices only apply when we're NOT cloning one original voice
-    # (a clone already carries the original speaker's own gender).
-    use_gender = reference_wav is None and bool(genders)
+    # and NOT in multi-speaker mode (both carry their own per-line voice already).
+    use_gender = reference_wav is None and bool(genders) and labels is None
     base_cond = None
-    if not use_gender:
+    if not use_gender and labels is None:
         try:
             base_cond = _conditioning(model, reference_wav=reference_wav)
         except Exception as e:
@@ -121,7 +148,20 @@ def synthesize(jobs, reference_wav=None, genders=None):
             except Exception:
                 return [None] * n
 
+    def _cond_for(i):
+        """Conditioning (gpt, speaker-embedding) for job index i, by mode priority."""
+        if labels is not None:
+            lab = labels[i]
+            if lab in spk_refs and os.path.exists(spk_refs[lab]):
+                return _conditioning(model, reference_wav=spk_refs[lab])
+            return _conditioning(model, speaker=SPEAKER_POOL[lab % len(SPEAKER_POOL)])
+        if use_gender:
+            g = genders[i] if i < len(genders) else "F"
+            return _conditioning(model, speaker=(MALE_SPEAKER if g == "M" else FEMALE_SPEAKER))
+        return base_cond
+
     sr = _state["sr"]
+    xlang = XTTS_LANGS.get(lang, "en")   # app code -> XTTS inference code
     out: list[str | None] = []
     for idx, (text, base) in enumerate(jobs, 1):
         text = (text or "").strip()
@@ -129,14 +169,13 @@ def synthesize(jobs, reference_wav=None, genders=None):
         # Skip segments with nothing speakable (music marks, lone punctuation, symbols).
         if text and re.search(r"[^\W_]", text, re.UNICODE):
             path = base + ".wav"
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                out.append(path)
+                print(f"__PCT__ {12 + int(73 * idx / n)}", flush=True)
+                continue
             try:
-                if use_gender:
-                    g = genders[idx - 1] if idx - 1 < len(genders) else "F"
-                    gpt, spk = _conditioning(
-                        model, speaker=(MALE_SPEAKER if g == "M" else FEMALE_SPEAKER))
-                else:
-                    gpt, spk = base_cond
-                res = model.inference(text, "en", gpt, spk,
+                gpt, spk = _cond_for(idx - 1)
+                res = model.inference(text, xlang, gpt, spk,
                                       temperature=0.7, enable_text_splitting=True)
                 wav = np.asarray(res["wav"], dtype="float32")
                 sf.write(path, wav, sr)

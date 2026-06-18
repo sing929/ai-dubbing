@@ -9,3 +9,25 @@
 librosa
 soundfile
 wavmark
+# Keep NumPy on the 1.x line - coqui-tts/XTTS + ml_dtypes are built against it and
+# fail to import under NumPy 2.x (which silently disables XTTS). If a later install
+# upgrades NumPy, run:  pip install "numpy>=1.26,<2"
+numpy>=1.26,<2
+
+# -------------------------------------------------------------------------------
+# OPTIONAL add-on #2: NEURAL speaker diarization (pyannote) for "Distinct voice
+# per speaker". Ported from OmniVoice-Studio. WITHOUT this, speakers.py uses the
+# built-in MFCC+pitch backend (no extra deps) - so this is a pure upgrade you can
+# skip. It splits similar same-gender voices the MFCC backend can't.
+#
+# DO NOT just `pip install pyannote.audio` blind - it re-pins torch/torchaudio/
+# numpy and can break the working cu121 + coqui-tts setup. Install deliberately:
+#   1) Make sure torch+cu121 is already installed (SETUP_VOICECLONE.md step 1).
+#   2) pip install --no-deps pyannote.audio    # then add only what import errors ask for
+#   3) Accept the model licence at huggingface.co/pyannote/speaker-diarization-3.1
+#      and huggingface.co/pyannote/segmentation-3.0 (gated), then set a token:
+#        setx HF_TOKEN hf_xxx     (new shells only)
+# speakers.neural_available() must return True for it to engage; otherwise the app
+# silently keeps using the MFCC backend. Override the model with env PYANNOTE_PIPELINE,
+# force the old backend with env SPEAKERS_BACKEND=mfcc.
+# pyannote.audio>=3.1   # <- intentionally commented; install by hand per the steps above

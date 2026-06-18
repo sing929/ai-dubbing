@@ -5,7 +5,11 @@ edge-tts
 pydub
 piper-tts
 demucs
-numpy
+# Pin to the 1.x line: the voice-clone add-ons (coqui-tts/XTTS, OpenVoice and their
+# ml_dtypes/transformers deps) ship binaries built against NumPy 1.x and crash on
+# import under NumPy 2.x. Letting this float to 2.x silently disables XTTS, which
+# drops English back to the flat edge-tts voice. See SETUP_VOICECLONE.md.
+numpy>=1.26,<2
 # Drag-and-drop GUI (dub_app.py)
 tkinterdnd2
 sv-ttk
