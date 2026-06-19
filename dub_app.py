@@ -14,6 +14,7 @@ import threading
 import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
+from self_learning_agent import optimize_dub_job_config
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -286,7 +287,9 @@ class DubApp:
     def _load_settings(self) -> dict:
         try:
             with open(SETTINGS, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                data.pop("deepseek_key", None)
+                return data
         except Exception:
             return {}
 
@@ -300,12 +303,19 @@ class DubApp:
                 "clone": self.clone.get(),
                 "gender": self.gender.get(),
                 "speakers": self.speakers.get(),
+                "speaker_override": {
+                    "enforce_single_speaker": self.single_speaker.get(),
+                    "primary_speaker_id": "Speaker_1",
+                    "diarization_sensitivity": 0.0 if self.single_speaker.get() else 0.5,
+                },
                 "scenefx": self.scenefx.get(),
                 "reuse_analysis": self.reuse_analysis.get(),
                 "length_fit": self.length_fit.get(),
+                "multimodal": self.multimodal.get(),
+                "multimodal_vision": self.multimodal_vision.get(),
+                "multimodal_fps": 1.0,
                 "preset": "facebook_reels" if self.reels_auto.get() else "",
                 "rights_mode": "owned_or_licensed" if self.rights_owned.get() else "",
-                "deepseek_key": self.deepseek_key.get(),
                 "voices": {lg: self._voice_id(lg) for lg in VOICE_CHOICES},
                 "geom": self.root.geometry(),
                 "queue": [{"path": it["path"],
@@ -582,6 +592,13 @@ class DubApp:
                               "and recurring characters. Falls back to audio speaker detection when "
                               "AI casting is unavailable. With male/female mode, each character gets "
                               "a gender-matched voice, including separate voices for same-gender roles.")
+        saved_override = s.get("speaker_override") if isinstance(s.get("speaker_override"), dict) else {}
+        self.single_speaker = tk.BooleanVar(value=bool(saved_override.get("enforce_single_speaker")))
+        cb_single = ttk.Checkbutton(opt, text="Force one speaker / one voice",
+                                    variable=self.single_speaker)
+        cb_single.pack(anchor="w", padx=8)
+        _Tooltip(cb_single, "For narrator-only clips. Uses the self-learning memory rule to stop "
+                            "false diarization splits from creating multiple AI voices.")
         self.scenefx = tk.BooleanVar(value=s.get("scenefx", False))
         cb_scenefx = ttk.Checkbutton(opt, text="Keep scene sounds (panting/shouts, not music)",
                                      variable=self.scenefx)
@@ -608,6 +625,15 @@ class DubApp:
                             "trim or expand only the lines that would overrun (or fall short of) their "
                             "time slot. Keeps the dub in sync with less audio speed-up, so it sounds more "
                             "natural. Needs a DeepSeek API key; lines that already fit cost nothing.")
+        self.multimodal = tk.BooleanVar(value=s.get("multimodal", False))
+        cb_mm = ttk.Checkbutton(opt, text="Use video frames for context and sync anchors",
+                                variable=self.multimodal)
+        cb_mm.pack(anchor="w", padx=8)
+        _Tooltip(cb_mm, "Sample video frames, attach visual context to each subtitle line, and use "
+                        "lip/timing anchors to keep translated speech from overrunning into the next "
+                        "shot. With a DeepSeek key it asks DeepSeek-VL for scene/emotion/ambiguity "
+                        "context; without one it still applies local timing anchors.")
+        self.multimodal_vision = tk.BooleanVar(value=s.get("multimodal_vision", True))
         mf = ttk.Frame(opt)
         mf.pack(fill="x", padx=8, pady=2)
         ttk.Label(mf, text="Accuracy:").pack(side="left")
@@ -1337,14 +1363,25 @@ class DubApp:
                "srt": self.srt.get() or reels, "naming": "firstline",
                "burn": self.burn.get() or reels,
                "tone": self.tone.get(), "audioonly": self.audioonly.get(),
-               "clone": self.clone.get() and not (self.speakers.get() or reels),
-               "gender": self.gender.get() or reels,
-               "speakers": self.speakers.get() or reels,
+               "clone": self.clone.get() and not (self.speakers.get() or reels or self.single_speaker.get()),
+               "gender": (self.gender.get() or reels) and not self.single_speaker.get(),
+               "speakers": (self.speakers.get() or reels) and not self.single_speaker.get(),
                "scenefx": self.scenefx.get(),
                "reuse_analysis": self.reuse_analysis.get(),
                "length_fit": self.length_fit.get() or reels,
-               "deepseek_key": self.deepseek_key.get().strip(),
+               "multimodal": self.multimodal.get() or reels,
+               "multimodal_vision": self.multimodal_vision.get(),
+               "multimodal_fps": 1.0,
+               "expected_speakers": 1 if self.single_speaker.get() else None,
+               "speaker_override": {
+                   "enforce_single_speaker": self.single_speaker.get(),
+                   "primary_speaker_id": "Speaker_1",
+                   "diarization_sensitivity": 0.0 if self.single_speaker.get() else 0.5,
+               },
+               "deepseek_key": "",
                "voices": {lg: self._voice_id(lg) for lg in langs.split(",") if lg}}
+        cfg = optimize_dub_job_config(cfg, os.path.join(BASE, "system_memory.json"))
+        self._runtime_deepseek_key = self.deepseek_key.get().strip()
         try:
             with open(JOBS, "w", encoding="utf-8") as f:
                 json.dump(cfg, f)
@@ -1371,9 +1408,12 @@ class DubApp:
     def _worker(self):
         cmd = [sys.executable, "-u", os.path.join(BASE, "dub.py"), "--jobs", JOBS]
         try:
+            env = os.environ.copy()
+            if getattr(self, "_runtime_deepseek_key", ""):
+                env["DEEPSEEK_API_KEY"] = self._runtime_deepseek_key
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, bufsize=1, encoding="utf-8", errors="replace",
-                                 creationflags=_NOWIN)
+                                 creationflags=_NOWIN, env=env)
             self.proc = p
             for line in p.stdout:
                 line = line.rstrip("\n")

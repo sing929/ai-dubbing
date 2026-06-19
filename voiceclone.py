@@ -18,6 +18,32 @@ CKPT_DIR = os.environ.get(
     "OPENVOICE_CKPT",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints_v2", "converter"),
 )
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORK_DIR = os.path.join(HERE, "_audio_work")
+
+
+def _prepare_runtime(ffmpeg=None):
+    """Give OpenVoice/numba/whisper writable local paths and bundled ffmpeg."""
+    tmp = os.path.join(WORK_DIR, "tmp")
+    numba_cache = os.path.join(WORK_DIR, "numba_cache")
+    try:
+        os.makedirs(tmp, exist_ok=True)
+        os.makedirs(numba_cache, exist_ok=True)
+    except Exception:
+        pass
+    os.environ.setdefault("TMP", tmp)
+    os.environ.setdefault("TEMP", tmp)
+    os.environ.setdefault("NUMBA_CACHE_DIR", numba_cache)
+
+    candidates = []
+    if ffmpeg:
+        candidates.append(os.path.dirname(os.path.abspath(ffmpeg)))
+    candidates.append(os.path.join(HERE, "ffmpeg-8.1.1-essentials_build", "bin"))
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    for folder in candidates:
+        if folder and os.path.isdir(folder) and folder not in path_parts:
+            os.environ["PATH"] = folder + os.pathsep + os.environ.get("PATH", "")
+            path_parts.insert(0, folder)
 
 _state = {"tried": False, "converter": None, "device": None}
 _target_se: dict = {}   # reference wav path -> original-speaker embedding (per video)
@@ -26,11 +52,13 @@ _source_se: dict = {}   # language code      -> base edge-tts voice embedding (p
 
 def available() -> bool:
     """True if OpenVoice + torch + the converter checkpoint can actually be loaded."""
+    _prepare_runtime()
     return _load() is not None
 
 
 def _load():
     """Lazy-load the ToneColorConverter exactly once. Returns it, or None if unavailable."""
+    _prepare_runtime()
     if _state["tried"]:
         return _state["converter"]
     _state["tried"] = True
@@ -104,6 +132,7 @@ def clone_segments(seg_paths, reference_wav, work_dir, lang, ffmpeg=None):
     otherwise. Never raises - any failure falls back to the original segment so a dub
     is always produced.
     """
+    _prepare_runtime(ffmpeg)
     converter = _load()
     if converter is None or not reference_wav or not os.path.exists(reference_wav):
         return seg_paths

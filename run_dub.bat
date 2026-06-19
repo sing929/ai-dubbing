@@ -1,5 +1,5 @@
 @echo off
-REM Launch the drag-and-drop dubbing GUI.
+REM Launch the main browser-based dubbing studio.
 cd /d "%~dp0"
-python dub_app.py
+python web_editor.py
 pause

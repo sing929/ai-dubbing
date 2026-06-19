@@ -40,12 +40,15 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from feedback_storage import FeedbackStorage, ValidationError
+from self_learning_agent import optimize_dub_job_config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(HERE, "_audio_work")
 OUT = os.path.join(HERE, "dubbed")
 HTML_PATH = os.path.join(HERE, "editor.html")
 SETTINGS = os.path.join(HERE, "_dubapp_settings.json")  # shared with dub_app.py
+FEEDBACK_DIR = os.path.join(HERE, "feedback")
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
@@ -190,6 +193,10 @@ def load_project(base: str, lang: str) -> dict:
             "src": s.get("text", ""),
             "tr": tr.get(str(i), ""),
             "speaker": s.get("speaker", 0),
+            "visual_context": s.get("visual_context") or {},
+            "visual_start": s.get("visual_start"),
+            "visual_end": s.get("visual_end"),
+            "visual_budget": s.get("visual_budget"),
         })
 
     out_media = _newest_output()
@@ -217,6 +224,15 @@ def save_translations(base: str, lang: str, tr: dict) -> None:
     cache_path = _tr_cache_path(base, lang)
     json.dump({"tr": {str(k): v for k, v in tr.items()}}, open(cache_path, "w", encoding="utf-8"),
               ensure_ascii=False)
+
+
+def feedback_store() -> FeedbackStorage:
+    return FeedbackStorage(FEEDBACK_DIR)
+
+
+def save_feedback_annotation(payload: dict) -> dict:
+    item = feedback_store().add(payload)
+    return item.model_dump(mode="json") if hasattr(item, "model_dump") else item.__dict__
 
 
 # ------------------------------------------------------------ project files
@@ -255,7 +271,11 @@ def load_proj_file(path: str) -> dict:
     segs = d.get("segments", [])
     rows = [{"i": s["i"], "start": s["start"], "end": s["end"], "src": s["src"],
              "tr": s.get("tr", ""), "speaker": s.get("speaker", 0),
-             "role": s.get("role"), "gender": s.get("gender"), "voice": s.get("voice")}
+             "role": s.get("role"), "gender": s.get("gender"), "voice": s.get("voice"),
+             "visual_context": s.get("visual_context") or {},
+             "visual_start": s.get("visual_start"), "visual_end": s.get("visual_end"),
+             "visual_budget": s.get("visual_budget"),
+             "lip_activity_confidence": s.get("lip_activity_confidence")}
             for s in segs]
     src, out = d.get("source"), d.get("output")
     src_ok = bool(src and os.path.exists(src) and _allowed(src))
@@ -351,6 +371,7 @@ def _base_cfg() -> dict:
     cfg.setdefault("model", "medium")
     cfg.setdefault("naming", "firstline")
     cfg["reuse_analysis"] = True
+    cfg["deepseek_key"] = ""
     cfg.pop("texts_override", None)
     return cfg
 
@@ -389,21 +410,29 @@ def _dub_app():
 
 def load_settings() -> dict:
     try:
-        return json.load(open(SETTINGS, encoding="utf-8"))
+        data = json.load(open(SETTINGS, encoding="utf-8"))
     except Exception:
         return {}
+    # Never echo a saved plaintext API key back to the browser. _saved_key() can
+    # still use an old key for backwards compatibility, but the UI should nudge
+    # new setups toward DEEPSEEK_API_KEY instead of keeping secrets in JSON.
+    data.pop("deepseek_key", None)
+    data["has_deepseek_key"] = bool(_saved_key())
+    data["deepseek_key_source"] = "env" if os.environ.get("DEEPSEEK_API_KEY", "").strip() else (
+        "legacy_file" if _saved_key() else "")
+    return data
 
 
 def save_settings(data: dict) -> dict:
     cur = load_settings()
     cur.update(data or {})
     try:
-        # Don't persist the API key in plaintext when the env var already provides
-        # it - that's the secret's proper home. (If there's no env var we still
-        # store it, so pasting a key into the GUI keeps working as before.)
+        # Do not persist API keys in plaintext settings. A pasted key can still be
+        # used for the current job via _start_job(), but durable config should use
+        # the DEEPSEEK_API_KEY environment variable.
         to_write = dict(cur)
-        if os.environ.get("DEEPSEEK_API_KEY", "").strip():
-            to_write.pop("deepseek_key", None)
+        for k in ("deepseek_key", "has_deepseek_key", "deepseek_key_source"):
+            to_write.pop(k, None)
         json.dump(to_write, open(SETTINGS, "w", encoding="utf-8"), ensure_ascii=False)
     except Exception as e:
         print(f"  [warn] could not save settings: {e}", flush=True)
@@ -509,13 +538,20 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
     lang = s.get("lang") or "en"
     voices = s.get("voices") or {}
     speakers = bool(s.get("speakers"))
+    speaker_override = s.get("speaker_override") if isinstance(s.get("speaker_override"), dict) else {}
+    enforce_single = bool(speaker_override.get("enforce_single_speaker"))
     preset = s.get("preset") or ""
     rights_mode = s.get("rights_mode") or ""
     facebook_reels = preset == "facebook_reels"
     if facebook_reels:
         speakers = True
         rights_mode = rights_mode or "owned_or_licensed"
-    return {
+    if enforce_single:
+        speakers = False
+        gender = False
+    else:
+        gender = bool(s.get("gender")) or facebook_reels
+    cfg = {
         "videos": [{"path": it["path"], "region": _region_str(it.get("region"))} for it in queue],
         "out": OUT, "work": WORK, "ffmpeg": _find_ffmpeg(),
         "langs": lang, "model": s.get("model", "medium"),
@@ -527,16 +563,26 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
         "burn": bool(s.get("burn")) or facebook_reels,
         "tone": s.get("tone", "original"), "audioonly": bool(s.get("audioonly")),
         "clone": bool(s.get("clone")) and not speakers and not facebook_reels,
-        "gender": bool(s.get("gender")) or facebook_reels,
+        "gender": gender,
         "speakers": speakers, "scenefx": bool(s.get("scenefx")),
         "reuse_analysis": bool(s.get("reuse_analysis", True)),
-        "length_fit": bool(s.get("length_fit")) or facebook_reels,
-        # Leave the key out of the on-disk jobs file when the env var is set; the
-        # dub subprocess inherits DEEPSEEK_API_KEY and dub.py falls back to it.
-        "deepseek_key": "" if os.environ.get("DEEPSEEK_API_KEY", "").strip()
-                        else (s.get("deepseek_key") or "").strip(),
+        # Disabled from the web UI: per-line DeepSeek length fitting can hang on
+        # long scripts, and the translation step already receives timing budgets.
+        "length_fit": False,
+        "multimodal": bool(s.get("multimodal")) or facebook_reels,
+        "multimodal_vision": bool(s.get("multimodal_vision", True)),
+        "multimodal_fps": float(s.get("multimodal_fps", 1.0)),
+        "expected_speakers": 1 if enforce_single else None,
+        "speaker_override": {
+            "enforce_single_speaker": enforce_single,
+            "primary_speaker_id": str(speaker_override.get("primary_speaker_id") or "Speaker_1"),
+            "diarization_sensitivity": float(speaker_override.get("diarization_sensitivity", 0.5)),
+        },
+        "deepseek_key": "",
+        "_runtime_deepseek_key": (s.get("deepseek_key") or "").strip() or _saved_key(),
         "voices": {lang: voices.get(lang) or default_voice.get(lang, "")},
     }
+    return optimize_dub_job_config(cfg, os.path.join(HERE, "system_memory.json"))
 
 
 def voice_preview(lang: str, voice: str) -> str | None:
@@ -593,11 +639,18 @@ def _start_job(cfg: dict, label: str) -> tuple[bool, str | None]:
     if JOB["proc"] is not None and JOB["proc"].poll() is None:
         return False, "A dub is already running."
     jobs_path = os.path.join(WORK, "_jobs_editor.json")
+    runtime_key = (cfg.pop("_runtime_deepseek_key", "") or "").strip()
+    if runtime_key:
+        cfg["deepseek_key"] = ""
     json.dump(cfg, open(jobs_path, "w", encoding="utf-8"), ensure_ascii=False)
     JOB.update(proc=None, lines=[], done=False, error=None, label=label)
+    env = os.environ.copy()
+    if runtime_key:
+        env["DEEPSEEK_API_KEY"] = runtime_key
     p = subprocess.Popen([sys.executable, os.path.join(HERE, "dub.py"), "--jobs", jobs_path],
                          cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, encoding="utf-8", errors="replace", creationflags=_NEW)
+                         text=True, encoding="utf-8", errors="replace", creationflags=_NEW,
+                         env=env)
     JOB["proc"] = p
 
     def reader():
@@ -663,6 +716,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(dub_meta())
             if u.path == "/api/cache":
                 return self._json(cache_stats())
+            if u.path == "/api/feedback":
+                limit = int(q.get("limit", ["50"])[0])
+                return self._json({"items": feedback_store().recent(limit)})
             if u.path == "/api/job":
                 running = JOB["proc"] is not None and JOB["proc"].poll() is None
                 return self._json({"running": running, "done": JOB["done"],
@@ -730,6 +786,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "No DeepSeek API key found."}, 400)
                 out, err = deepseek(b.get("system", ""), b.get("user", ""), key)
                 return self._json({"error": err} if err else {"reply": out})
+            if u.path == "/api/feedback":
+                try:
+                    row = save_feedback_annotation(self._body())
+                except ValidationError as e:
+                    return self._json({"error": str(e)}, 400)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                return self._json({"ok": True, "annotation": row})
             if u.path == "/api/settings":
                 return self._json({"settings": save_settings(self._body())})
             if u.path == "/api/add_videos":

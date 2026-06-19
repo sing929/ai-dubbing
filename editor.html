@@ -51,12 +51,22 @@
   #queue li .qdel:hover{color:var(--err)}
   .frow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .frow label{color:var(--muted);font-size:13px}
+  .modeGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:8px}
+  .modeBtn{border:1px solid var(--line);background:var(--panel2);color:var(--text);
+    border-radius:10px;padding:11px 12px;text-align:left;min-height:74px}
+  .modeBtn strong{display:block;font-size:13px;margin-bottom:4px}
+  .modeBtn span{display:block;color:var(--muted);font-size:12px;line-height:1.3}
+  .modeBtn.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .advanced{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+  .advanced summary{cursor:pointer;color:var(--muted);font-size:13px;font-weight:600;margin-bottom:10px}
   .card select,.card input[type=number],.card input[type=password]{background:var(--panel2);
     color:var(--text);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:13px}
   .opts{display:grid;grid-template-columns:1fr 1fr;gap:8px 18px}
   .opts label{display:flex;align-items:center;gap:8px;color:var(--text);font-size:13px}
   .opts label.inline{gap:8px}
   .opts input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
+  #keyHint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.35}
+  #keyHint.warn{color:var(--warn)}
   .runrow{display:flex;align-items:center;gap:14px;margin-top:6px}
   .btn.big{padding:12px 30px;font-size:15px}
   .muted{color:var(--muted)}
@@ -165,6 +175,24 @@
   #asstStatus{font-size:12px;color:var(--muted);margin-top:8px;min-height:1.2em}
   #asstOut{white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);
     border-radius:8px;padding:10px;margin-top:8px;font-size:13px;max-height:200px;overflow:auto;display:none}
+  #feedbackPanel{position:fixed;right:18px;bottom:150px;width:430px;max-height:72vh;
+    background:var(--panel);border:1px solid var(--line);border-radius:14px;z-index:55;
+    display:none;flex-direction:column;box-shadow:0 14px 50px rgba(0,0,0,.6)}
+  #feedbackPanel.open{display:flex}
+  #feedbackPanel h3{margin:0;padding:14px 16px;border-bottom:1px solid var(--line);font-size:15px;
+    display:flex;align-items:center;gap:8px}
+  #feedbackPanel h3 .x{margin-left:auto;color:var(--muted);background:none;border:none;font-size:18px}
+  .fbBody{padding:14px 16px;overflow:auto}
+  .fbBody label{font-size:12px;color:var(--muted);display:block;margin:8px 0 4px}
+  .fbBody select,.fbBody textarea{width:100%;background:var(--panel2);color:var(--text);
+    border:1px solid var(--line);border-radius:8px;padding:8px;font-size:13px;font-family:inherit}
+  .fbBody textarea{min-height:78px;resize:vertical}
+  .fbLine{background:rgba(255,255,255,.035);border:1px solid var(--line);border-radius:8px;
+    padding:9px 10px;font-size:12px;line-height:1.45;color:var(--muted);margin-bottom:8px}
+  .fbLine strong{display:block;color:var(--text);font-size:13px;margin-bottom:3px}
+  #feedbackStatus{font-size:12px;color:var(--muted);margin-top:8px;min-height:1.2em}
+  #feedbackRecent{font-size:12px;color:var(--muted);margin-top:10px;border-top:1px solid var(--line);
+    padding-top:10px;line-height:1.4}
   .toast{position:fixed;bottom:150px;left:50%;transform:translateX(-50%);background:var(--panel2);
     border:1px solid var(--line);padding:9px 16px;border-radius:10px;z-index:80;opacity:0;
     transition:opacity .2s}
@@ -223,12 +251,22 @@
         </div>
 
         <div class="card">
-          <div class="cardhead">Options</div>
-          <div class="frow" style="margin-bottom:10px">
-            <button class="btn primary" id="reelsPreset" title="Apply automatic Facebook Reels export settings">Facebook Reels Auto</button>
-            <label title="Confirm the source video and music are owned/licensed for Facebook upload."><input type="checkbox" id="o_rights"> Owned/licensed source</label>
+          <div class="cardhead">Workflow</div>
+          <div class="modeGrid">
+            <button class="modeBtn" data-mode="fast"><strong>Fast Draft</strong><span>Quick translation and voice for checking the cut.</span></button>
+            <button class="modeBtn" data-mode="quality"><strong>Best Quality</strong><span>Music bed, character voices, timing help, safer defaults.</span></button>
+            <button class="modeBtn" data-mode="reels"><strong>Facebook Reels</strong><span>Vertical export with burned captions and licensed-source flag.</span></button>
           </div>
-          <div class="opts">
+          <div class="frow" style="margin-top:12px">
+            <label title="Use this when the source video has exactly one speaker. It collapses diarization and AI casting so the output keeps one voice profile."><input type="checkbox" id="o_single"> Force one speaker</label>
+          </div>
+          <input type="hidden" id="hMode" value="quality">
+          <details class="advanced">
+            <summary>Advanced options</summary>
+            <div class="frow" style="margin-bottom:10px">
+              <label title="Confirm the source video and music are owned/licensed for Facebook upload."><input type="checkbox" id="o_rights"> Owned/licensed source</label>
+            </div>
+            <div class="opts">
             <label title="Blur over the original burned-in subtitle area."><input type="checkbox" id="o_cover"> Cover original subtitles</label>
             <label class="inline" title="Fallback blur height when no box is drawn.">Bottom strip % <input type="number" id="o_band" min="8" max="40" value="18" style="width:60px"></label>
             <label title="Reframe to vertical 1080×1920 with blurred fill."><input type="checkbox" id="o_fb"> Make 9:16 Facebook-ready</label>
@@ -238,13 +276,16 @@
             <label title="Export only the dubbed audio (.wav), no video render."><input type="checkbox" id="o_audioonly"> Dubbed audio only (no video)</label>
             <label title="Make the dub sound like the original speaker (OpenVoice, GPU)."><input type="checkbox" id="o_clone"> Clone original speaker's voice (GPU)</label>
             <label title="Male voice for male lines, female for female (by pitch)."><input type="checkbox" id="o_gender"> Auto male/female voices</label>
-            <label title="Use AI script casting plus speaker detection to give narrator/characters separate voices."><input type="checkbox" id="o_speakers"> Distinct voice per character</label>
+            <label title="Off by default. Enable only for videos with multiple real speakers."><input type="checkbox" id="o_speakers"> Distinct voice per character</label>
+            <label class="inline" title="0 is most conservative; 100 allows easier speaker splitting.">Speaker split sensitivity <input type="number" id="o_sensitivity" min="0" max="100" value="35" style="width:68px"></label>
             <label title="Keep panting/shouts from gaps (Demucs), drop music."><input type="checkbox" id="o_scenefx"> Keep scene sounds</label>
             <label title="Cache transcription so other languages dub fast."><input type="checkbox" id="o_reuse" checked> Fast re-dub (reuse transcription)</label>
-            <label title="Use DeepSeek to shorten/expand translated lines so TTS needs less speed-stretching."><input type="checkbox" id="o_lengthfit"> Fit translated line length</label>
+            <label title="Sample frames for visual context and timing anchors. With DeepSeek key, uses vision analysis; without one, uses local timing anchors."><input type="checkbox" id="o_multimodal"> Video-frame context + sync anchors</label>
+            <label title="Disabled in the UI for now: this can hang on long scripts."><input type="checkbox" id="o_lengthfit" disabled> Fit translated line length</label>
             <label class="inline" title="Whisper model size.">Accuracy <select id="o_model"><option>tiny</option><option>base</option><option>small</option><option selected>medium</option></select></label>
             <label class="inline" title="Match the original speaker's pace/pitch, or a natural even tone.">Tone <select id="o_tone"><option value="original">Match original voice</option><option value="natural">Natural (translation)</option></select></label>
-          </div>
+            </div>
+          </details>
         </div>
 
         <div class="card">
@@ -253,6 +294,7 @@
             <label>DeepSeek API key</label>
             <input type="password" id="hKey" placeholder="sk-…  (blank = free Google translate)" style="flex:1;min-width:240px">
           </div>
+          <div id="keyHint">Keys pasted here are used for the current run only. For permanent use, set DEEPSEEK_API_KEY in your environment.</div>
         </div>
 
         <div class="runrow">
@@ -273,6 +315,7 @@
     <select id="langSel" title="Target language"></select>
     <div class="spacer"></div>
     <div class="pts" id="pts"></div>
+    <button class="btn" id="feedbackBtn" title="Save a human correction for the selected subtitle line">Self-learning feedback</button>
     <button class="btn" id="importBtn">📹 Import video</button>
     <button class="btn" id="redubBtn" title="Re-voice the audio using your edited translations">🔁 Re-dub</button>
     <button class="btn" id="reloadBtn">↻ Reload</button>
@@ -365,6 +408,29 @@
       </div>
       <div id="asstStatus"></div>
       <div id="asstOut"></div>
+    </div>
+  </div>
+
+  <div id="feedbackPanel">
+    <h3>Self-learning feedback <span style="font-size:11px;color:var(--muted);font-weight:400">Human review</span>
+      <button class="x" id="feedbackClose">X</button></h3>
+    <div class="fbBody">
+      <div class="fbLine" id="feedbackLine">Select a subtitle line first.</div>
+      <label>Error category</label>
+      <select id="feedbackCategory">
+        <option value="timing_mismatch">Timing mismatch</option>
+        <option value="wrong_tone">Wrong tone</option>
+        <option value="mistranslation">Mistranslation</option>
+      </select>
+      <label>Corrected output</label>
+      <textarea id="feedbackCorrected" placeholder="Optional: write the corrected English line here"></textarea>
+      <label>Notes for future self-correction</label>
+      <textarea id="feedbackNotes" placeholder="Example: The speaker is laughing here, use a casual tone and stop 0.5s earlier."></textarea>
+      <div class="asstRow">
+        <button class="btn primary" id="feedbackSave">Save to self-learning dataset</button>
+      </div>
+      <div id="feedbackStatus"></div>
+      <div id="feedbackRecent">Saved corrections become local training/preference examples for future runs.</div>
     </div>
   </div>
 
@@ -503,6 +569,7 @@ function selectRow(i,scroll,seek){
   selIdx=i;
   $$('.seg').forEach(s=>s.classList.toggle('sel',+s.dataset.i===i));
   $$('.block').forEach(b=>b.classList.toggle('sel',+b.dataset.i===i));
+  updateFeedbackLine();
   if(scroll){const el=document.querySelector('.seg[data-i="'+i+'"]');if(el)el.scrollIntoView({block:'nearest',behavior:'smooth'});
     const bl=document.querySelector('.block[data-i="'+i+'"]');if(bl)bl.scrollIntoView({inline:'center',behavior:'smooth'});}
   if(seek){const pl=activePlayer();if(pl){try{pl.currentTime=P.rows[i].start;}catch(e){}}}
@@ -577,6 +644,74 @@ $('#asstApply').addEventListener('click',()=>{
 });
 function asstStatus(m,kind){const s=$('#asstStatus');s.textContent=m;
   s.style.color=kind==='err'?'var(--err)':kind==='ok'?'var(--ok)':kind==='warn'?'var(--warn)':'var(--muted)';}
+
+/* ---- Human feedback / self-learning ---- */
+function selectedRow(){return P && P.rows ? P.rows[selIdx] : null;}
+function updateFeedbackLine(){
+  const box=$('#feedbackLine'); if(!box) return;
+  const r=selectedRow();
+  if(!r){box.textContent='Select a subtitle line first.';return;}
+  box.innerHTML=`<strong>${fmt(r.start)} → ${fmt(r.end)}</strong>
+    <div>${escapeHtml(r.src||'')}</div>
+    <div style="color:var(--text);margin-top:5px">${escapeHtml(r.tr||'')}</div>`;
+  const corr=$('#feedbackCorrected');
+  if(corr && document.activeElement!==corr && !corr.value.trim()) corr.value=r.tr||'';
+}
+async function refreshFeedbackRecent(){
+  const el=$('#feedbackRecent'); if(!el) return;
+  try{
+    const d=await (await fetch('/api/feedback?limit=5')).json();
+    const n=(d.items||[]).length;
+    el.textContent=n ? `${n} recent correction(s) stored locally for future runs.`
+      : 'Saved corrections become local training/preference examples for future runs.';
+  }catch(e){
+    el.textContent='Feedback store is local; recent corrections could not be loaded.';
+  }
+}
+function feedbackStatus(m,kind){
+  const s=$('#feedbackStatus'); s.textContent=m;
+  s.style.color=kind==='err'?'var(--err)':kind==='ok'?'var(--ok)':kind==='warn'?'var(--warn)':'var(--muted)';
+}
+$('#feedbackBtn').addEventListener('click',async()=>{
+  updateFeedbackLine();
+  $('#feedbackPanel').classList.add('open');
+  $('#asstPanel').classList.remove('open');
+  await refreshFeedbackRecent();
+});
+$('#feedbackClose').addEventListener('click',()=>$('#feedbackPanel').classList.remove('open'));
+$('#feedbackSave').addEventListener('click',async()=>{
+  const r=selectedRow();
+  if(!r){feedbackStatus('Select a subtitle line first.','warn');return;}
+  const notes=$('#feedbackNotes').value.trim();
+  const corrected=$('#feedbackCorrected').value.trim();
+  if(!notes && !corrected){feedbackStatus('Add a note or corrected output first.','warn');return;}
+  const payload={
+    video_id:P.base||P.id||'video',
+    project_id:P.id||'',
+    segment_index:r.i,
+    timestamp_start:+r.start||0,
+    timestamp_end:+r.end||(+r.start||0),
+    error_category:$('#feedbackCategory').value,
+    original_output:r.tr||'',
+    corrected_output:corrected,
+    user_annotation_notes:notes,
+    resolved_state:!!corrected,
+    source_text:r.src||'',
+    target_language:P.lang||'',
+    visual_context:r.visual_context||{}
+  };
+  feedbackStatus('Saving correction…','');
+  try{
+    const res=await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    const d=await res.json();
+    if(!res.ok || d.error){feedbackStatus(d.error||'Could not save feedback.','err');return;}
+    $('#feedbackNotes').value='';
+    feedbackStatus('Saved. Future runs will use this correction memory.','ok');
+    toast('Feedback saved to self-learning dataset');
+    await refreshFeedbackRecent();
+  }catch(e){feedbackStatus('Save failed: '+e,'err');}
+});
 
 /* ---- import / re-dub / job progress ---- */
 let jobTimer=null;
@@ -655,6 +790,53 @@ $$('.navtab').forEach(t=>t.addEventListener('click',()=>switchView(t.dataset.vie
 $('.back').addEventListener('click',()=>switchView('home'));
 
 function setChk(id,v){$('#'+id).checked=!!v;}
+function setMode(mode){
+  $('#hMode').value=mode;
+  $$('.modeBtn').forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));
+}
+function applyMode(mode, persist=true){
+  setMode(mode);
+  if(mode==='fast'){
+    setChk('o_single', true);
+    setChk('o_rights', false); setChk('o_cover', true); setChk('o_fb', false);
+    setChk('o_keepmusic', false); setChk('o_srt', false); setChk('o_burn', false);
+    setChk('o_audioonly', false); setChk('o_clone', false); setChk('o_gender', false);
+    setChk('o_speakers', false); setChk('o_scenefx', false); setChk('o_reuse', true);
+    setChk('o_multimodal', false); setChk('o_lengthfit', false); $('#o_sensitivity').value='20';
+    $('#o_model').value='small'; $('#o_tone').value='natural';
+  }else if(mode==='quality'){
+    setChk('o_single', true);
+    setChk('o_rights', false); setChk('o_cover', true); setChk('o_fb', false);
+    setChk('o_keepmusic', true); setChk('o_srt', true); setChk('o_burn', false);
+    setChk('o_audioonly', false); setChk('o_clone', false); setChk('o_gender', false);
+    setChk('o_speakers', false); setChk('o_scenefx', false); setChk('o_reuse', true);
+    setChk('o_multimodal', true); setChk('o_lengthfit', false); $('#o_sensitivity').value='0';
+    $('#o_model').value='medium'; $('#o_tone').value='original';
+  }else if(mode==='reels'){
+    setChk('o_single', true);
+    setChk('o_rights', true); setChk('o_cover', true); setChk('o_fb', true);
+    setChk('o_keepmusic', true); setChk('o_srt', true); setChk('o_burn', true);
+    setChk('o_audioonly', false); setChk('o_clone', false); setChk('o_gender', false);
+    setChk('o_speakers', false); setChk('o_scenefx', true); setChk('o_reuse', true);
+    setChk('o_multimodal', true); setChk('o_lengthfit', false); $('#o_sensitivity').value='0';
+    $('#o_model').value='medium'; $('#o_tone').value='original';
+  }
+  syncVoiceModeOptions();
+  $('#homeStatus').textContent = mode==='fast' ? 'Fast Draft mode applied'
+    : mode==='quality' ? 'Best Quality mode applied'
+    : mode==='reels' ? 'Facebook Reels mode applied' : 'Custom mode';
+  if(persist) saveHome();
+}
+function inferMode(s){
+  if(s.mode) return s.mode;
+  if(s.preset==='facebook_reels' || (s.rights_mode==='owned_or_licensed' && s.fb && s.burn && s.srt)) return 'reels';
+  if(s.keepmusic && s.speakers && s.gender) return 'quality';
+  return 'fast';
+}
+function markCustom(){
+  if(!META) return;
+  if($('#hMode').value!=='custom') setMode('custom');
+}
 function refreshHomeVoices(){
   const code=$('#hLang').value, hv=$('#hVoice'); hv.innerHTML='';
   (META.voice_choices[code]||[]).forEach(v=>{const o=document.createElement('option');o.value=v.id;o.textContent=v.label;hv.appendChild(o);});
@@ -674,18 +856,27 @@ function renderQueue(){
 function collectSettings(){
   const code=$('#hLang').value; curVoices[code]=$('#hVoice').value;
   const characterVoices = $('#o_speakers').checked;
+  const forceSingle = $('#o_single').checked;
   if(characterVoices) $('#o_clone').checked = false;
-  const rightsOk = $('#o_rights').checked;
-  const preset = rightsOk && $('#o_fb').checked && $('#o_burn').checked && $('#o_srt').checked
-    ? 'facebook_reels' : '';
-  return {lang:code, voices:curVoices,
+  const mode = $('#hMode').value || 'quality';
+  const rightsOk = $('#o_rights').checked || mode==='reels';
+  const preset = mode==='reels' ? 'facebook_reels' : '';
+  return {lang:code, mode:mode, voices:curVoices,
     cover:$('#o_cover').checked, band:+$('#o_band').value, fb:$('#o_fb').checked,
     keepmusic:$('#o_keepmusic').checked, srt:$('#o_srt').checked, burn:$('#o_burn').checked,
-    audioonly:$('#o_audioonly').checked, clone:!characterVoices && $('#o_clone').checked, gender:$('#o_gender').checked,
-    speakers:$('#o_speakers').checked, scenefx:$('#o_scenefx').checked,
-    reuse_analysis:$('#o_reuse').checked, length_fit:$('#o_lengthfit').checked,
+    audioonly:$('#o_audioonly').checked, clone:!characterVoices && $('#o_clone').checked, gender:$('#o_gender').checked && !forceSingle,
+    speakers:$('#o_speakers').checked && !forceSingle, scenefx:$('#o_scenefx').checked,
+    reuse_analysis:$('#o_reuse').checked, length_fit:false,
+    multimodal:$('#o_multimodal').checked,
+    multimodal_vision:true,
+    multimodal_fps:1.0,
     model:$('#o_model').value, tone:$('#o_tone').value,
     preset:preset, rights_mode:rightsOk?'owned_or_licensed':'',
+    speaker_override:{
+      enforce_single_speaker:forceSingle,
+      primary_speaker_id:'Speaker_1',
+      diarization_sensitivity:Math.max(0, Math.min(1, (+$('#o_sensitivity').value || 0) / 100))
+    },
     deepseek_key:$('#hKey').value};
 }
 let saveT=null;
@@ -721,43 +912,44 @@ async function loadMeta(){
   setChk('o_fb',s.fb); setChk('o_keepmusic',s.keepmusic); setChk('o_srt',s.srt);
   setChk('o_burn',s.burn); setChk('o_audioonly',s.audioonly); setChk('o_clone',s.clone);
   setChk('o_gender',s.gender); setChk('o_speakers',s.speakers); setChk('o_scenefx',s.scenefx);
+  setChk('o_multimodal',s.multimodal);
+  setChk('o_single', s.speaker_override && s.speaker_override.enforce_single_speaker);
+  $('#o_sensitivity').value = Math.round(((s.speaker_override && s.speaker_override.diarization_sensitivity) ?? 0.35) * 100);
   syncVoiceModeOptions();
   setChk('o_reuse', s.reuse_analysis!==undefined?s.reuse_analysis:true);
   setChk('o_lengthfit', s.length_fit);
   setChk('o_rights', s.rights_mode==='owned_or_licensed');
   $('#o_model').value=s.model||'medium'; $('#o_tone').value=s.tone||'original';
-  $('#hKey').value=s.deepseek_key||'';
+  setMode(inferMode(s));
+  $('#hKey').value='';
+  if(s.has_deepseek_key){
+    $('#keyHint').textContent = s.deepseek_key_source==='env'
+      ? 'DeepSeek key loaded from DEEPSEEK_API_KEY.'
+      : 'A legacy saved DeepSeek key is available, but new pasted keys are current-run only. Move it to DEEPSEEK_API_KEY when convenient.';
+    $('#keyHint').classList.toggle('warn', s.deepseek_key_source==='legacy_file');
+  }
   renderQueue();
 }
 function syncVoiceModeOptions(){
+  const forceSingle = $('#o_single').checked;
   const characterVoices = $('#o_speakers').checked;
+  if(forceSingle){
+    $('#o_speakers').checked = false;
+    $('#o_gender').checked = false;
+  }
   if(characterVoices) $('#o_clone').checked = false;
+  $('#o_speakers').disabled = forceSingle;
+  $('#o_gender').disabled = forceSingle;
+  $('#o_sensitivity').disabled = forceSingle;
+  $('#o_lengthfit').checked = false;
+  $('#o_lengthfit').disabled = true;
   $('#o_clone').disabled = characterVoices;
 }
-function applyReelsPreset(){
-  setChk('o_rights', true);
-  setChk('o_cover', true);
-  setChk('o_fb', true);
-  setChk('o_keepmusic', true);
-  setChk('o_srt', true);
-  setChk('o_burn', true);
-  setChk('o_audioonly', false);
-  setChk('o_clone', false);
-  setChk('o_gender', true);
-  setChk('o_speakers', true);
-  setChk('o_scenefx', true);
-  setChk('o_reuse', true);
-  setChk('o_lengthfit', true);
-  $('#o_model').value='medium';
-  $('#o_tone').value='original';
-  syncVoiceModeOptions();
-  $('#homeStatus').textContent='Facebook Reels Auto applied';
-  saveHome();
-}
-['o_cover','o_band','o_fb','o_keepmusic','o_srt','o_burn','o_audioonly','o_clone','o_gender','o_speakers','o_scenefx','o_reuse','o_lengthfit','o_model','o_tone','o_rights','hKey','hVoice']
-  .forEach(id=>$('#'+id).addEventListener('change',saveHome));
-$('#reelsPreset').addEventListener('click',applyReelsPreset);
+['o_cover','o_band','o_fb','o_keepmusic','o_srt','o_burn','o_audioonly','o_clone','o_gender','o_speakers','o_single','o_sensitivity','o_scenefx','o_reuse','o_multimodal','o_lengthfit','o_model','o_tone','o_rights','hKey','hVoice']
+  .forEach(id=>$('#'+id).addEventListener('change',()=>{ if(id!=='hKey' && id!=='hVoice') markCustom(); saveHome(); }));
+$$('.modeBtn').forEach(b=>b.addEventListener('click',()=>applyMode(b.dataset.mode)));
 $('#o_speakers').addEventListener('change',syncVoiceModeOptions);
+$('#o_single').addEventListener('change',syncVoiceModeOptions);
 $('#hLang').addEventListener('change',()=>{refreshHomeVoices();saveHome();});
 
 $('#addVids').addEventListener('click',()=>$('#fileInput').click());

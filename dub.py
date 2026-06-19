@@ -20,6 +20,11 @@ import hashlib
 import asyncio
 import subprocess
 import importlib.util
+from multimodal_aligner import (
+    MultimodalAligner,
+    apply_multimodal_context,
+    enforce_alignment_constraints,
+)
 
 # Quieter first-run model download (these are harmless Windows/HF notices).
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -79,6 +84,7 @@ import edge_tts                                    # noqa: E402
 import warnings                                     # noqa: E402
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="pydub")
 from pydub import AudioSegment                     # noqa: E402
+from feedback_storage import FeedbackStorage       # noqa: E402
 try:
     import numpy as np                              # noqa: E402  (ships with faster-whisper)
 except Exception:
@@ -338,6 +344,11 @@ def write_project(path: str, *, base: str, source: str, output: str, audio_only:
             "gender": cast_genders[i] if (cast_genders is not None and i < len(cast_genders)) else None,
             "voice": seg_voices[i] if (seg_voices is not None and i < len(seg_voices)) else None,
             "source_track": s.get("source"),
+            "visual_context": s.get("visual_context") or {},
+            "visual_start": s.get("visual_start"),
+            "visual_end": s.get("visual_end"),
+            "visual_budget": s.get("visual_budget"),
+            "lip_activity_confidence": s.get("lip_activity_confidence"),
         })
     data = {
         "version": 1, "base": base,
@@ -345,6 +356,7 @@ def write_project(path: str, *, base: str, source: str, output: str, audio_only:
         "audio_only": audio_only, "src_lang": src_lang, "lang": lang,
         "preset": preset, "rights_mode": rights_mode,
         "story_bible": story_bible or {},
+        "multimodal_summary": (story_bible or {}).get("visual_summary", ""),
         "created": int(time.time()),
         "duration": round(float(segs[-1]["end"]), 3) if segs else 0.0,
         "segments": segments,
@@ -1067,9 +1079,58 @@ def _story_bible_brief(story_bible: dict | None) -> str:
     return "\n".join(parts)[:3500]
 
 
+def _feedback_lessons(limit: int = 10) -> list[str]:
+    try:
+        store = FeedbackStorage(os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback"))
+        return store.lessons(limit=limit)
+    except Exception:
+        return []
+
+
+def _merge_feedback_lessons(story_bible: dict | None) -> dict | None:
+    lessons = _feedback_lessons()
+    if not lessons:
+        return story_bible
+    data = dict(story_bible or {})
+    rules = list(data.get("translation_rules") or [])
+    for lesson in lessons:
+        rule = "Human correction memory: " + lesson
+        if rule not in rules:
+            rules.append(rule)
+    data["translation_rules"] = rules
+    return data
+
+
+def _visual_context_brief(visual_contexts: list[dict] | None) -> str:
+    if not visual_contexts:
+        return ""
+    lines = []
+    for idx, ctx in enumerate(visual_contexts[:40], 1):
+        if not isinstance(ctx, dict):
+            continue
+        bits = []
+        for key in ("setting", "speaker_expression", "visual_context"):
+            val = str(ctx.get(key) or "").strip()
+            if val:
+                bits.append(f"{key}: {val}")
+        terms = ctx.get("ambiguous_terms")
+        if isinstance(terms, dict) and terms:
+            bits.append("ambiguous_terms: " + json.dumps(terms, ensure_ascii=False))
+        if bits:
+            lines.append(f"{idx}. " + "; ".join(bits))
+    if not lines:
+        return ""
+    return (
+        "Visual context by line. Use it to resolve ambiguous words, emotion, tone, "
+        "and whether a phrase should sound formal, casual, joking, angry, or urgent:\n"
+        + "\n".join(lines)
+    )[:3500]
+
+
 def _ds_span(lines: list[str], target: str, api_key: str,
              durations: list[float] | None, depth: int = 0,
-             story_bible: dict | None = None) -> list[str | None]:
+             story_bible: dict | None = None,
+             visual_contexts: list[dict] | None = None) -> list[str | None]:
     """Translate one batch of lines via DeepSeek, returning a same-length list
     (None for any line we couldn't get). On a bad reply (wrong line count, or
     JSON the model malformed) we retry at a cooler temperature; if it still fails
@@ -1091,6 +1152,7 @@ def _ds_span(lines: list[str], target: str, api_key: str,
         budget_rule = ("Keep each line about as short as the source so it "
                        "fits the original speaking time. ")
     bible = _story_bible_brief(story_bible)
+    visual = _visual_context_brief(visual_contexts)
     context_rule = (
         "Use the story context below to keep character gender, pronouns, names, "
         "relationships, and who-did-what consistent across lines. For Chinese 他/她/TA, "
@@ -1101,6 +1163,8 @@ def _ds_span(lines: list[str], target: str, api_key: str,
         "Keep character gender, pronouns, names, relationships, and who-did-what "
         "consistent across lines. For Chinese 他/她/TA, infer the referent from story "
         "context; if uncertain, use the character name or neutral phrasing.\n")
+    if visual:
+        context_rule += "\n" + visual + "\n"
     sys_msg = (
         f"You are a professional video-dubbing translator. Translate each "
         f"numbered line into natural, spoken {target}, the way a voice actor "
@@ -1125,14 +1189,17 @@ def _ds_span(lines: list[str], target: str, api_key: str,
         mid = len(lines) // 2
         dl = durations[:mid] if durations is not None else None
         dr = durations[mid:] if durations is not None else None
-        return (_ds_span(lines[:mid], target, api_key, dl, depth + 1, story_bible)
-                + _ds_span(lines[mid:], target, api_key, dr, depth + 1, story_bible))
+        vl = visual_contexts[:mid] if visual_contexts is not None else None
+        vr = visual_contexts[mid:] if visual_contexts is not None else None
+        return (_ds_span(lines[:mid], target, api_key, dl, depth + 1, story_bible, vl)
+                + _ds_span(lines[mid:], target, api_key, dr, depth + 1, story_bible, vr))
     return [None] * len(lines)
 
 
 def _deepseek_translate(lines: list[str], lang: str, api_key: str,
                         durations: list[float] | None = None,
-                        story_bible: dict | None = None) -> list[str] | None:
+                        story_bible: dict | None = None,
+                        visual_contexts: list[dict] | None = None) -> list[str] | None:
     """Translate every line with DeepSeek. Returns a same-length list (a line that
     couldn't be translated even after splitting becomes ""), or None only when the
     whole call fails outright (e.g. bad key) so the caller can fall back.
@@ -1145,7 +1212,9 @@ def _deepseek_translate(lines: list[str], lang: str, api_key: str,
     pos = 0
     for chunk in _chunk(lines, _DS_MAX_CHARS, _DS_MAX_LINES):
         d = durations[pos:pos + len(chunk)] if durations is not None else None
-        out.extend(_ds_span(chunk, target, api_key, d, story_bible=story_bible))
+        vc = visual_contexts[pos:pos + len(chunk)] if visual_contexts is not None else None
+        out.extend(_ds_span(chunk, target, api_key, d, story_bible=story_bible,
+                            visual_contexts=vc))
         pos += len(chunk)
     if all(v is None for v in out):        # nothing came back -> let caller fall back
         return None
@@ -1188,7 +1257,8 @@ def cleanup_script_lines(lines: list[str], api_key: str) -> tuple[list[str], int
 def translate_segments(lines: list[str], lang: str, source_lang: str = "auto",
                        api_key: str = "",
                        durations: list[float] | None = None,
-                       story_bible: dict | None = None) -> list[str]:
+                       story_bible: dict | None = None,
+                       visual_contexts: list[dict] | None = None) -> list[str]:
     """Translate lines: DeepSeek first (when a key is set), then Google, then
     MyMemory. Batched to avoid the throttling hundreds of separate requests
     trigger. A line that cannot be translated becomes "" (skipped later) - never
@@ -1200,7 +1270,7 @@ def translate_segments(lines: list[str], lang: str, source_lang: str = "auto",
         return []
     key = _deepseek_key(api_key)
     if key:
-        res = _deepseek_translate(lines, lang, key, durations, story_bible)
+        res = _deepseek_translate(lines, lang, key, durations, story_bible, visual_contexts)
         if res:
             ok = _drop_untranslated(res, lang)
             if sum(1 for r in ok if r.strip()) >= len(lines) * 0.6:
@@ -1525,7 +1595,8 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
                     s["text"] = txt
         # Budget each translation to the original line's spoken time so DeepSeek keeps
         # it short enough to stay in sync (floor avoids an impossible budget on blips).
-        durations = [max(0.6, s["end"] - s["start"]) for s in segs]
+        durations = [max(0.6, float(s.get("visual_budget") or (s["end"] - s["start"]))) for s in segs]
+        visual_contexts = [s.get("visual_context") or {} for s in segs]
         if story_bible is None and _deepseek_key(api_key):
             bible_sig = hashlib.sha1(json.dumps(src_lines, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
             bible_path = os.path.join(work, "analysis", f"{base}_{bible_sig}_story.json")
@@ -1545,9 +1616,11 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
                     except Exception:
                         pass
                     print(f"  story context: {len(story_bible.get('characters') or [])} characters", flush=True)
+        story_bible = _merge_feedback_lessons(story_bible)
         tr_sig = hashlib.sha1(json.dumps(
             {"v": 2, "lang": lang, "src": src_lines,
              "story": story_bible or {},
+             "visual": visual_contexts,
              "dur": [round(d, 2) for d in durations]},
             ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
         tr_cache = os.path.join(work, "analysis", f"{base}_{lang}_{tr_sig}_tr.json")
@@ -1561,7 +1634,8 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
             except Exception:
                 texts = None
         if texts is None:
-            texts = translate_segments(src_lines, lang, source_lang, api_key, durations, story_bible)
+            texts = translate_segments(src_lines, lang, source_lang, api_key, durations,
+                                       story_bible, visual_contexts)
             try:
                 os.makedirs(os.path.dirname(tr_cache), exist_ok=True)
                 json.dump({"texts": texts}, open(tr_cache, "w", encoding="utf-8"),
@@ -1579,13 +1653,26 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
             key = _deepseek_key(api_key)
             if key:
                 import speech_rate
-                slots = [max(0.6, s["end"] - s["start"]) for s in segs]
+                slots = [max(0.6, float(s.get("visual_budget") or (s["end"] - s["start"]))) for s in segs]
                 srcs = [s.get("text", "") for s in segs]
                 print(f"__STAGE__ {lang.upper()}: fitting length", flush=True)
                 texts, nfit = speech_rate.fit_texts_counted(
                     texts, slots, lang, _deepseek_chat_fn(key), srcs)
                 print(f"  [{lang}] length-fit adjusted {nfit}/{len(texts)} lines",
                       flush=True)
+        key = _deepseek_key(api_key)
+        texts, align_decisions = enforce_alignment_constraints(
+            segs,
+            texts,
+            lang,
+            _deepseek_chat_fn(key) if key else None,
+            max_tempo=MAX_FIT_TEMPO,
+        )
+        n_hard = sum(1 for d in align_decisions if d.action not in ("accept", "time_stretch"))
+        n_stretch = sum(1 for d in align_decisions if d.action == "time_stretch")
+        if n_hard or n_stretch:
+            print(f"  [{lang}] visual alignment: {n_stretch} stretch, {n_hard} truncation decisions",
+                  flush=True)
     print("__PCT__ 12", flush=True)
 
     if naming == "firstline":
@@ -1698,7 +1785,10 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         # push following lines only a little; otherwise the whole clip drifts late.
         start = max(orig_start, min(cursor, orig_start + MAX_SYNC_DRIFT_MS))
         nxt = int(segs[i + 1]["start"] * 1000) if i + 1 < len(segs) else total_ms
-        room = max(300, nxt - start)                          # time left before the next line
+        visual_end = int(float(s.get("visual_end") or 0.0) * 1000)
+        scene_end = int(float(s.get("scene_visual_end") or 0.0) * 1000)
+        hard_end = min([x for x in (nxt, visual_end, scene_end) if x > start] or [nxt])
+        room = max(300, hard_end - start)                      # physical visual boundary
         fit_wav = os.path.join(seg_dir, f"{i:03d}_fit.wav")
         if use_xtts:
             # XTTS speech is already natural but runs a bit longer than the source.
@@ -1920,7 +2010,36 @@ def save_analysis(work: str, base: str, video: str, model_size: str, total_ms: i
         print(f"  (could not cache analysis: {str(e)[:50]})", flush=True)
 
 
-def diarize_once(vocals: str | None, segs: list[dict]) -> list[int] | None:
+def normalize_speaker_override(raw) -> dict:
+    """Structured job contract for caller-supplied speaker metadata.
+
+    Example:
+      {"enforce_single_speaker": true,
+       "primary_speaker_id": "Speaker_1",
+       "diarization_sensitivity": 0.0}
+
+    `enforce_single_speaker` is authoritative: downstream diarization/AI casting
+    is collapsed to one identity, so a noisy single-speaker clip cannot turn into
+    multiple cloned voices. `diarization_sensitivity` is optional middleware for
+    multi-speaker mode: 0.0 is most conservative, 1.0 is most eager to split.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        sens = float(raw.get("diarization_sensitivity", 0.5))
+    except Exception:
+        sens = 0.5
+    sens = _clamp(sens, 0.0, 1.0)
+    primary = str(raw.get("primary_speaker_id") or "Speaker_1").strip() or "Speaker_1"
+    return {
+        "enforce_single_speaker": bool(raw.get("enforce_single_speaker")),
+        "primary_speaker_id": primary,
+        "diarization_sensitivity": sens,
+    }
+
+
+def diarize_once(vocals: str | None, segs: list[dict],
+                 diarization_sensitivity: float = 0.5) -> list[int] | None:
     """Run speaker diarization once for the video (language-independent). Returns
     per-segment speaker labels, or None when there's one speaker / it's
     unavailable. Logged once here so make_dub() can reuse the result per language."""
@@ -1930,7 +2049,11 @@ def diarize_once(vocals: str | None, segs: list[dict]) -> list[int] | None:
     try:
         import speakers
         if speakers.available():
-            labels = speakers.diarize(vocals, segs)
+            # Sensitivity maps to the clustering split threshold. Low sensitivity
+            # requires a much stronger cluster separation before creating a second
+            # speaker, which protects narrator/recap videos from false splits.
+            min_silhouette = 0.32 - (0.20 * _clamp(diarization_sensitivity, 0.0, 1.0))
+            labels = speakers.diarize(vocals, segs, min_silhouette=min_silhouette)
     except Exception as e:
         print(f"  speaker split unavailable ({str(e)[:50]}); using one voice.", flush=True)
     if labels and len(set(labels)) > 1:
@@ -1944,21 +2067,32 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
             tone="natural", audio_only=False, clone=False, api_key="",
             gender_mode=False, scene_fx=False, speakers_mode=False,
             model_size="medium", reuse_analysis=True, texts_override=None,
-            length_fit=False, preset: str = "", rights_mode: str = ""):
+            length_fit=False, preset: str = "", rights_mode: str = "",
+            speaker_override: dict | None = None,
+            multimodal: bool = False, multimodal_vision: bool = True,
+            multimodal_fps: float = 1.0):
     video = os.path.abspath(video)
     base = os.path.splitext(os.path.basename(video))[0]
+    speaker_override = normalize_speaker_override(speaker_override)
     facebook_reels = preset == "facebook_reels"
     if facebook_reels:
         fb_vertical = True
         burn_subs = True
         make_srt = True
         cover_subs = True
-        length_fit = True
+        length_fit = False
         speakers_mode = True
         gender_mode = True
         clone = False
         rights_mode = rights_mode or "owned_or_licensed"
         print("  preset: Facebook Reels Auto (owned/licensed source)", flush=True)
+    if speaker_override["enforce_single_speaker"]:
+        speakers_mode = False
+        gender_mode = False
+        print(f"  speaker override: enforcing one voice "
+              f"({speaker_override['primary_speaker_id']})", flush=True)
+    if multimodal and not api_key:
+        print("  multimodal context: DeepSeek key missing; using local timing anchors only", flush=True)
     print(f"> {base}: dubbing -> {', '.join(langs)}", flush=True)
     bed, vocals = None, None
     # Gender mode judges male/female from the speaker's pitch, which is only
@@ -1985,6 +2119,8 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
     # speaker split) from a previous run on this same video, so dubbing it into a
     # NEW language skips Whisper + diarization and goes straight to translate+TTS.
     analysis_key = ("facebook_reels_v2_story" if facebook_reels else "default")
+    if multimodal:
+        analysis_key += "_mm"
     cached = load_analysis(work, base, video, model_size, analysis_key) if reuse_analysis else None
     if cached:
         segs = cached["segs"]
@@ -1992,7 +2128,7 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
         total_ms = cached.get("total_ms", total_ms)
         orig_stats = cached.get("orig_stats")
         median_dbfs = cached.get("median_dbfs")
-        spk_labels = cached.get("spk_labels")
+        spk_labels = None if speaker_override["enforce_single_speaker"] else cached.get("spk_labels")
         alt_meta = cached.get("alt_meta") or {}
         print(f"  reusing cached analysis: {len(segs)} segments, source "
               f"{src_lang} (skipping transcription)", flush=True)
@@ -2004,6 +2140,24 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
         print("  no speech detected; skipping.", flush=True)
         return
 
+    if multimodal:
+        print("__STAGE__ Analyzing visual context", flush=True)
+        try:
+            aligner = MultimodalAligner(ffmpeg, work, api_key=api_key,
+                                        frame_sample_rate=multimodal_fps)
+            mm_context = aligner.analyze(
+                video, segs, total_ms=total_ms,
+                cache_key=f"{base}_{analysis_key}",
+                use_vision=multimodal_vision,
+            )
+            apply_multimodal_context(segs, mm_context)
+            alt_meta["multimodal"] = mm_context.to_dict()
+            if mm_context.summary:
+                print(f"  visual context: {mm_context.summary[:120]}", flush=True)
+            print(f"  timing anchors: {len(mm_context.lip_activity)} segments", flush=True)
+        except Exception as e:
+            print(f"  multimodal context skipped ({str(e)[:80]})", flush=True)
+
     # Compute (or back-fill) the original-voice stats when this run needs them and
     # the cache didn't already have them (e.g. first run was tone=natural).
     if (tone == "original" or gender_mode) and orig_stats is None:
@@ -2014,8 +2168,11 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
             print("  tone=original: original audio unavailable; matching pace only.", flush=True)
 
     # Diarize once for the whole video (not per language) and back-fill the cache.
-    if speakers_mode and vocals and spk_labels is None:
-        spk_labels = diarize_once(vocals, segs)
+    if speaker_override["enforce_single_speaker"]:
+        spk_labels = None
+    elif speakers_mode and vocals and spk_labels is None:
+        spk_labels = diarize_once(
+            vocals, segs, speaker_override["diarization_sensitivity"])
 
     save_analysis(work, base, video, model_size, total_ms, src_lang, segs,
                   orig_stats, median_dbfs, spk_labels,
@@ -2028,7 +2185,8 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
                  tone, orig_stats, median_dbfs, audio_only, clone, vocals, api_key, gender_mode,
                  scene_fx, spk_labels if speakers_mode else None,
                  texts_override=(texts_override or {}).get(lang),
-                 length_fit=length_fit, cast_mode=speakers_mode,
+                 length_fit=length_fit,
+                 cast_mode=(speakers_mode and not speaker_override["enforce_single_speaker"]),
                  script_cleanup=facebook_reels, preset=preset,
                  rights_mode=rights_mode,
                  voice_duck=facebook_reels and bool(bed))
@@ -2064,6 +2222,10 @@ def main() -> None:
         tone = cfg.get("tone", "original")
         preset = cfg.get("preset", "")
         rights_mode = cfg.get("rights_mode", "")
+        if isinstance(cfg.get("_learning_applied"), dict):
+            learned = cfg["_learning_applied"]
+            print(f"  learning optimizer: applied {learned.get('error_type', 'memory rule')} "
+                  f"{learned.get('speaker_override', '')}", flush=True)
         model = WhisperModel(cfg.get("model", "medium"), device="cpu", compute_type="int8")
         for i, item in enumerate(videos, 1):
             if isinstance(item, str):
@@ -2084,7 +2246,11 @@ def main() -> None:
                         cfg.get("texts_override"),
                         cfg.get("length_fit", False),
                         cfg.get("preset", preset),
-                        cfg.get("rights_mode", rights_mode))
+                        cfg.get("rights_mode", rights_mode),
+                        cfg.get("speaker_override"),
+                        cfg.get("multimodal", False),
+                        cfg.get("multimodal_vision", True),
+                        cfg.get("multimodal_fps", 1.0))
             except Exception as e:
                 print(f"  ERROR on {os.path.basename(video)}: {e}", flush=True)
             print(f"__FILEDONE__ {i}", flush=True)
