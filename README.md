@@ -53,6 +53,14 @@ voices. A CUDA GPU is recommended — on CPU it works but is slow. Set `XTTS_DIS
 to turn it off. Note: the XTTS-v2 model is under the Coqui Public Model License
 (non-commercial) — review it before commercial use.
 
+## Optional: MOSS local voice
+
+MOSS-TTS-Nano is installed beside this app at `E:\dub\MOSS-TTS-Nano` and can be
+enabled from the GUI with **Use MOSS local voice (experimental, CPU OK)**. It uses
+the ONNX CPU backend for supported languages and can clone from the original voice
+when **Clone original speaker's voice** is also enabled. First use downloads the
+ONNX model files into `E:\dub\MOSS-TTS-Nano\models`; after that it runs locally.
+
 ## Optional: sound like the original speaker
 
 Needs an NVIDIA GPU and a one-time setup. Follow

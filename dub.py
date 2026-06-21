@@ -1743,27 +1743,52 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         nm = sum(1 for g in genders if g == "M")
         print(f"  [{lang}] gender voices: {nm} male / {len(genders) - nm} female lines", flush=True)
     print(f"__STAGE__ {lang.upper()}: voicing", flush=True)
-    # XTTS-supported languages: prefer XTTS v2 (local, natural, and clones the
-    # original speaker from the vocals stem when one is present). It supersedes Piper
-    # AND the OpenVoice clone step; when coqui-tts / the model aren't installed
-    # available() is False and we fall back to the normal Piper/edge-tts path.
-    # Languages XTTS can't model (vi/id/ms) stay on edge-tts. See xtts.XTTS_LANGS.
-    import xtts
-    force_edge_voices = bool(seg_voices) or (not clone and lang in VOICES)
-    use_xtts = (not force_edge_voices) and lang in xtts.XTTS_LANGS and xtts.available()
-    if use_xtts:
-        # With multi-speaker + clone, give XTTS one reference per speaker so each is
-        # voiced in their OWN voice; without clone, XTTS assigns a distinct built-in
-        # speaker per id. Otherwise: clone the single original (only when ticked), or
-        # use the gender/built-in path. `vocals` can exist for unrelated reasons
-        # (gender / scene-fx / keep-music all run Demucs), so we never clone by default.
+    # MOSS-TTS-Nano is an optional ONNX CPU-friendly backend. It is only enabled
+    # when the GUI sets MOSS_TTS_ENABLE=1, and falls back quietly like XTTS/OpenVoice.
+    use_moss = False
+    use_xtts = False
+    if os.environ.get("MOSS_TTS_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            import moss_tts
+            use_moss = lang in moss_tts.MOSS_LANGS and moss_tts.available()
+        except Exception as e:
+            print(f"  [moss] unavailable ({str(e)[:70]}); using normal voice.", flush=True)
+            use_moss = False
+
+    if use_moss:
+        import moss_tts
         if spk_labels is not None and clone and vocals:
             spk_refs = build_speaker_refs(vocals, segs, spk_labels, seg_dir)
-        paths = xtts.synthesize(jobs, vocals if (clone and spk_labels is None) else None,
-                                genders, lang, spk_labels=spk_labels, spk_refs=spk_refs)
+        paths = moss_tts.synthesize(
+            jobs,
+            vocals if (clone and spk_labels is None) else None,
+            genders,
+            lang,
+            spk_labels=spk_labels,
+            spk_refs=spk_refs,
+        )
     else:
-        paths = tts_all(jobs, lang, seg_voices)
-    if clone and vocals and not use_xtts and spk_labels is None:
+        # XTTS-supported languages: prefer XTTS v2 (local, natural, and clones the
+        # original speaker from the vocals stem when one is present). It supersedes Piper
+        # AND the OpenVoice clone step; when coqui-tts / the model aren't installed
+        # available() is False and we fall back to the normal Piper/edge-tts path.
+        # Languages XTTS can't model (vi/id/ms) stay on edge-tts. See xtts.XTTS_LANGS.
+        import xtts
+        force_edge_voices = bool(seg_voices) or (not clone and lang in VOICES)
+        use_xtts = (not force_edge_voices) and lang in xtts.XTTS_LANGS and xtts.available()
+        if use_xtts:
+            # With multi-speaker + clone, give XTTS one reference per speaker so each is
+            # voiced in their OWN voice; without clone, XTTS assigns a distinct built-in
+            # speaker per id. Otherwise: clone the single original (only when ticked), or
+            # use the gender/built-in path. `vocals` can exist for unrelated reasons
+            # (gender / scene-fx / keep-music all run Demucs), so we never clone by default.
+            if spk_labels is not None and clone and vocals:
+                spk_refs = build_speaker_refs(vocals, segs, spk_labels, seg_dir)
+            paths = xtts.synthesize(jobs, vocals if (clone and spk_labels is None) else None,
+                                    genders, lang, spk_labels=spk_labels, spk_refs=spk_refs)
+        else:
+            paths = tts_all(jobs, lang, seg_voices)
+    if clone and vocals and not use_moss and not use_xtts and spk_labels is None:
         # (OpenVoice clones to ONE reference, which would collapse multi-speaker voices
         # back into a single voice, so we skip it when speakers were split.)
         print(f"__STAGE__ {lang.upper()}: cloning original voice", flush=True)
@@ -1790,8 +1815,8 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         hard_end = min([x for x in (nxt, visual_end, scene_end) if x > start] or [nxt])
         room = max(300, hard_end - start)                      # physical visual boundary
         fit_wav = os.path.join(seg_dir, f"{i:03d}_fit.wav")
-        if use_xtts:
-            # XTTS speech is already natural but runs a bit longer than the source.
+        if use_moss or use_xtts:
+            # Neural local TTS is already natural but can run a bit longer than the source.
             # Pitch-warping (tone=original) or hard time-compression mangles neural
             # speech into the "can't understand it" mush, so for XTTS we do neither:
             # no pitch shift, only a mild speed-up, and let the timeline drift and
@@ -2075,6 +2100,7 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
     base = os.path.splitext(os.path.basename(video))[0]
     speaker_override = normalize_speaker_override(speaker_override)
     facebook_reels = preset == "facebook_reels"
+    moss_enabled = os.environ.get("MOSS_TTS_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
     if facebook_reels:
         fb_vertical = True
         burn_subs = True
@@ -2083,7 +2109,8 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
         length_fit = False
         speakers_mode = True
         gender_mode = True
-        clone = False
+        if not moss_enabled:
+            clone = False
         rights_mode = rights_mode or "owned_or_licensed"
         print("  preset: Facebook Reels Auto (owned/licensed source)", flush=True)
     if speaker_override["enforce_single_speaker"]:
@@ -2102,10 +2129,10 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
         bed, vocals = ensure_bed(video, base, work, ffmpeg)
     if not keepmusic:
         bed = None
-    if clone and speakers_mode:
+    if clone and speakers_mode and not moss_enabled:
         print("  [clone] disabled for character voices; using separate cast voices.", flush=True)
         clone = False
-    if clone:
+    if clone and not moss_enabled:
         import voiceclone
         if not voiceclone.available():
             print("  [clone] OpenVoice/torch not ready; see SETUP_VOICECLONE.md. Using normal voice.", flush=True)
@@ -2212,6 +2239,12 @@ def main() -> None:
         ffmpeg, out_dir, work = _setup(cfg["ffmpeg"], cfg["out"], cfg["work"])
         model_size = cfg.get("model", "medium")
         langs = [x.strip() for x in cfg["langs"].split(",") if x.strip() in VOICES]
+        if cfg.get("moss_tts"):
+            os.environ["MOSS_TTS_ENABLE"] = "1"
+            os.environ.setdefault(
+                "MOSS_TTS_REPO",
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "MOSS-TTS-Nano")),
+            )
         # GUI voice picker: each ticked language carries the chosen edge-tts voice.
         # Apply it (and drop Piper for that language) so the picked voice is what plays.
         for lg, vid in (cfg.get("voices") or {}).items():

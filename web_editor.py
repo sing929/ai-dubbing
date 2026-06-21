@@ -537,6 +537,7 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
         default_voice = {}
     lang = s.get("lang") or "en"
     voices = s.get("voices") or {}
+    moss_tts = bool(s.get("moss_tts"))
     speakers = bool(s.get("speakers"))
     speaker_override = s.get("speaker_override") if isinstance(s.get("speaker_override"), dict) else {}
     enforce_single = bool(speaker_override.get("enforce_single_speaker"))
@@ -562,7 +563,8 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
         "srt": bool(s.get("srt")) or facebook_reels, "naming": "firstline",
         "burn": bool(s.get("burn")) or facebook_reels,
         "tone": s.get("tone", "original"), "audioonly": bool(s.get("audioonly")),
-        "clone": bool(s.get("clone")) and not speakers and not facebook_reels,
+        "clone": bool(s.get("clone")) and (moss_tts or not (speakers or facebook_reels)),
+        "moss_tts": moss_tts,
         "gender": gender,
         "speakers": speakers, "scenefx": bool(s.get("scenefx")),
         "reuse_analysis": bool(s.get("reuse_analysis", True)),
@@ -647,6 +649,9 @@ def _start_job(cfg: dict, label: str) -> tuple[bool, str | None]:
     env = os.environ.copy()
     if runtime_key:
         env["DEEPSEEK_API_KEY"] = runtime_key
+    if cfg.get("moss_tts"):
+        env["MOSS_TTS_ENABLE"] = "1"
+        env.setdefault("MOSS_TTS_REPO", os.path.abspath(os.path.join(HERE, "..", "MOSS-TTS-Nano")))
     p = subprocess.Popen([sys.executable, os.path.join(HERE, "dub.py"), "--jobs", jobs_path],
                          cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, encoding="utf-8", errors="replace", creationflags=_NEW,
