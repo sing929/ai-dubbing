@@ -301,6 +301,7 @@ class DubApp:
                 "fb": self.fb.get(), "srt": self.srt.get(), "burn": self.burn.get(),
                 "tone": self.tone.get(), "audioonly": self.audioonly.get(),
                 "clone": self.clone.get(),
+                "moss_tts": self.moss_tts.get(),
                 "gender": self.gender.get(),
                 "speakers": self.speakers.get(),
                 "speaker_override": {
@@ -575,6 +576,14 @@ class DubApp:
         _Tooltip(cb_clone, "Make the dub SOUND LIKE the original speaker, using OpenVoice on your PC. "
                            "Needs an NVIDIA GPU and the one-time setup in SETUP_VOICECLONE.md. "
                            "If it isn't set up, this safely falls back to the normal voice. Slow on CPU.")
+        self.moss_tts = tk.BooleanVar(value=s.get("moss_tts", False))
+        cb_moss = ttk.Checkbutton(opt, text="Use MOSS local voice (experimental, CPU OK)",
+                                  variable=self.moss_tts)
+        cb_moss.pack(anchor="w", padx=8)
+        _Tooltip(cb_moss, "Use the local MOSS-TTS-Nano ONNX backend for supported languages. "
+                          "It can clone from the original voice when Clone is enabled, runs on CPU, "
+                          "and falls back to the normal voice if MOSS is not ready. First use may "
+                          "download the MOSS ONNX model files.")
         self.gender = tk.BooleanVar(value=s.get("gender", False))
         cb_gender = ttk.Checkbutton(opt, text="Auto male/female voices (match each speaker's gender)",
                                     variable=self.gender)
@@ -1363,7 +1372,8 @@ class DubApp:
                "srt": self.srt.get() or reels, "naming": "firstline",
                "burn": self.burn.get() or reels,
                "tone": self.tone.get(), "audioonly": self.audioonly.get(),
-               "clone": self.clone.get() and not (self.speakers.get() or reels or self.single_speaker.get()),
+               "clone": self.clone.get() and (self.moss_tts.get() or not (self.speakers.get() or reels)),
+               "moss_tts": self.moss_tts.get(),
                "gender": (self.gender.get() or reels) and not self.single_speaker.get(),
                "speakers": (self.speakers.get() or reels) and not self.single_speaker.get(),
                "scenefx": self.scenefx.get(),
@@ -1411,6 +1421,9 @@ class DubApp:
             env = os.environ.copy()
             if getattr(self, "_runtime_deepseek_key", ""):
                 env["DEEPSEEK_API_KEY"] = self._runtime_deepseek_key
+            if self.moss_tts.get():
+                env["MOSS_TTS_ENABLE"] = "1"
+                env.setdefault("MOSS_TTS_REPO", os.path.abspath(os.path.join(BASE, "..", "MOSS-TTS-Nano")))
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, bufsize=1, encoding="utf-8", errors="replace",
                                  creationflags=_NOWIN, env=env)

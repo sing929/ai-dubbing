@@ -295,7 +295,7 @@ class MultimodalAligner:
                     "-q:v", "8", str(path),
                 ]
                 try:
-                    subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
                 except Exception:
                     pass
             if path.exists():
