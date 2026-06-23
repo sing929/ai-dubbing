@@ -49,6 +49,7 @@
   #queue li .qname{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #queue li .qdel{border:none;background:none;color:var(--muted);font-size:16px}
   #queue li .qdel:hover{color:var(--err)}
+  #queue li .qmark{border:1px solid var(--line);background:var(--bg);color:var(--text);border-radius:7px;padding:4px 8px;font-size:11px}
   .frow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .frow label{color:var(--muted);font-size:13px}
   .modeGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:8px}
@@ -70,6 +71,10 @@
   .runrow{display:flex;align-items:center;gap:14px;margin-top:6px}
   .btn.big{padding:12px 30px;font-size:15px}
   .muted{color:var(--muted)}
+  #maskDialog{width:min(760px,92vw);border:1px solid var(--line);border-radius:14px;background:var(--panel);color:var(--text);padding:0;box-shadow:0 20px 60px #000}
+  #maskDialog::backdrop{background:rgba(0,0,0,.72)}
+  .maskHead,.maskFoot{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .maskFoot{border-bottom:0;border-top:1px solid var(--line);justify-content:flex-end}.maskBody{padding:14px 16px}.maskStage{position:relative;margin:auto;width:fit-content;max-width:100%;line-height:0}.maskStage video{display:block;max-width:100%;max-height:62vh}.maskRect{position:absolute;border:2px solid var(--accent);background:rgba(124,92,255,.18);cursor:move;min-width:24px;min-height:18px}.maskHandle{position:absolute;right:-6px;bottom:-6px;width:12px;height:12px;background:#fff;border:2px solid var(--accent);border-radius:50%;cursor:nwse-resize}
 
   /* ---- top bar ---- */
   #top{height:52px;display:flex;align-items:center;gap:14px;padding:0 16px;
@@ -245,12 +250,14 @@
           <div class="cardhead">Language &amp; voice</div>
           <div class="frow">
             <label>Target language</label><select id="hLang"></select>
-            <label>Voice</label><select id="hVoice"></select>
+            <label>TTS engine</label><select id="hTtsProvider"><option value="elevenlabs">ElevenLabs</option><option value="moss">MOSS local</option></select>
+            <label>Natural voice</label><select id="hGender"><option value="female">Female</option><option value="male">Male</option></select>
             <button class="btn" id="hPreview">▶ Preview</button>
             <audio id="hPrevAudio" style="display:none"></audio>
           </div>
           <div class="frow" style="margin-top:12px">
-            <label title="Use the installed MOSS-TTS-Nano ONNX voice backend. Runs locally on CPU and can clone from the original voice when Clone is enabled."><input type="checkbox" id="o_moss"> Use MOSS local voice</label>
+            <label id="mossHint">MOSS runs locally. ElevenLabs uses the selected natural male/female voice.</label>
+            <label title="Detect speakers and assign a distinct voice to each person."><input type="checkbox" id="o_separate" checked> Separate multiple speakers</label>
             <label title="With MOSS enabled this clones from the original voice on CPU. Without MOSS it uses the older OpenVoice GPU path."><input type="checkbox" id="o_clone"> Clone original speaker's voice</label>
           </div>
         </div>
@@ -293,12 +300,13 @@
         </div>
 
         <div class="card">
-          <div class="cardhead">Translation (optional)</div>
+          <div class="cardhead">Translation & voice services</div>
           <div class="frow">
             <label>DeepSeek API key</label>
-            <input type="password" id="hKey" placeholder="sk-…  (blank = free Google translate)" style="flex:1;min-width:240px">
+            <input type="password" id="hKey" placeholder="DeepSeek key" style="flex:1;min-width:240px">
           </div>
-          <div id="keyHint">Keys pasted here are used for the current run only. For permanent use, set DEEPSEEK_API_KEY in your environment.</div>
+          <div class="frow" style="margin-top:10px"><label>ElevenLabs API key</label><input type="password" id="hElevenKey" placeholder="Paste once; saved in Windows Credential Manager" style="flex:1;min-width:240px"></div>
+          <div id="keyHint">Keys are saved locally in Windows Credential Manager and are never written to the project settings file.</div>
         </div>
 
         <div class="runrow">
@@ -310,6 +318,8 @@
       </div>
     </div>
   </div>
+
+  <dialog id="maskDialog"><div class="maskHead"><strong>Cover original subtitles</strong><span class="muted">Drag the box or set its size precisely.</span></div><div class="maskBody"><div class="maskStage" id="maskStage"><video id="maskVideo" controls></video><div class="maskRect" id="maskRect"><span class="maskHandle" id="maskHandle"></span></div></div></div><div class="maskFoot"><label>Width % <input id="maskWidth" type="number" min="3" max="100" step="1"></label><label>Height % <input id="maskHeight" type="number" min="3" max="100" step="1"></label><button class="btn" id="maskCancel">Cancel</button><button class="btn primary" id="maskApply">Apply cover area</button></div></dialog>
 
   <div id="viewEditor" class="view">
   <div id="top">
@@ -470,6 +480,8 @@ async function loadProjects(){
   const ls=$('#langSel'); ls.innerHTML='';
   (d.langs||['en']).forEach(l=>{const o=document.createElement('option');o.value=l;o.textContent=(langNames[l]||l);ls.appendChild(o);});
   $('#pts').innerHTML = d.has_key ? 'DeepSeek key ✓' : '<small>no DeepSeek key</small>';
+  $('#pts').textContent = (d.has_key ? 'DeepSeek connected' : 'DeepSeek key missing')
+    + ' · ' + (d.has_elevenlabs ? 'ElevenLabs natural voice connected' : 'ElevenLabs key missing');
   if(d.projects.length) await loadProject();
   else $('#rows').innerHTML='<div style="padding:30px;color:var(--muted)">No projects yet. Dub something first.</div>';
 }
@@ -544,12 +556,16 @@ function renderTimeline(){
 
 function curMedia(){return side==='original'?{url:P.original_url,name:P.original_name}:{url:P.translated_url,name:P.translated_name};}
 function isVideo(name){return /\.(mp4|mkv|mov|webm)$/i.test(name||'');}
-function setupMedia(){
+async function setupMedia(){
   const m=curMedia(), v=$('#player'), aw=$('#audioWrap'), a=$('#aplayer');
   const t=activePlayer()?activePlayer().currentTime:currentTime;
   if(!m.url){v.style.display='none';aw.style.display='flex';$('#audioLbl').textContent='(no media found for this side)';a.removeAttribute('src');$('#poster').src='';return;}
   if(isVideo(m.name)){
-    aw.style.display='none'; v.style.display='block'; v.src=m.url; v.currentTime=t;
+    aw.style.display='none'; v.style.display='block';
+    try{const path=new URLSearchParams(m.url.split('?')[1]).get('path');const r=await fetch('/api/browser_preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});const d=await r.json();if(d.error)throw Error(d.error);v.src=d.url;}catch(e){v.src=m.url;}
+    v.load();
+    v.onloadedmetadata=()=>{try{v.currentTime=t;}catch(e){}};
+    v.onerror=()=>{aw.style.display='flex';v.style.display='none';$('#audioLbl').textContent='Video preview could not load. Click Reload in the desktop app, then reopen this project.';};
   }else{
     v.style.display='none'; aw.style.display='flex'; a.src=m.url; $('#audioLbl').textContent='🎧 '+m.name;
     $('#poster').src = P.poster_url||''; $('#poster').style.display = P.poster_url?'block':'none';
@@ -890,9 +906,7 @@ function markCustom(){
   if($('#hMode').value!=='custom') setMode('custom');
 }
 function refreshHomeVoices(){
-  const code=$('#hLang').value, hv=$('#hVoice'); hv.innerHTML='';
-  (META.voice_choices[code]||[]).forEach(v=>{const o=document.createElement('option');o.value=v.id;o.textContent=v.label;hv.appendChild(o);});
-  hv.value = curVoices[code] || META.default_voice[code] || (hv.options[0]&&hv.options[0].value);
+  // ElevenLabs chooses the best available voice for the requested gender internally.
 }
 function renderQueue(){
   const ul=$('#queue'); ul.innerHTML='';
@@ -901,15 +915,16 @@ function renderQueue(){
     li.innerHTML=`<span class="qname" title="${escapeHtml(q.path)}">${escapeHtml(q.path.split(/[\\/]/).pop())}</span>`;
     const del=document.createElement('button');del.className='qdel';del.textContent='✕';
     del.onclick=()=>{QUEUE.splice(idx,1);renderQueue();saveHome();};
-    li.appendChild(del); ul.appendChild(li);
+    const mark=document.createElement('button');mark.className='qmark';mark.textContent=q.region?'Cover area set':'Mark subtitles';mark.onclick=()=>openMask(idx);
+    li.appendChild(mark); li.appendChild(del); ul.appendChild(li);
   });
   $('#queueEmpty').style.display = QUEUE.length?'none':'block';
 }
 function collectSettings(){
-  const code=$('#hLang').value; curVoices[code]=$('#hVoice').value;
+  const code=$('#hLang').value;
   const characterVoices = $('#o_speakers').checked;
   const forceSingle = $('#o_single').checked;
-  const moss = $('#o_moss').checked;
+  const moss = $('#hTtsProvider').value==='moss';
   if(characterVoices && !moss) $('#o_clone').checked = false;
   const mode = $('#hMode').value || 'quality';
   const rightsOk = $('#o_rights').checked || mode==='reels';
@@ -918,7 +933,7 @@ function collectSettings(){
     cover:$('#o_cover').checked, band:+$('#o_band').value, fb:$('#o_fb').checked,
     keepmusic:$('#o_keepmusic').checked, srt:$('#o_srt').checked, burn:$('#o_burn').checked,
     audioonly:$('#o_audioonly').checked, clone:(moss || !characterVoices) && $('#o_clone').checked, moss_tts:moss, gender:$('#o_gender').checked && !forceSingle,
-    speakers:$('#o_speakers').checked && !forceSingle, scenefx:$('#o_scenefx').checked,
+    speakers:($('#o_speakers').checked || $('#o_separate').checked) && !forceSingle, scenefx:$('#o_scenefx').checked,
     reuse_analysis:$('#o_reuse').checked, length_fit:false,
     multimodal:$('#o_multimodal').checked,
     multimodal_vision:true,
@@ -930,7 +945,9 @@ function collectSettings(){
       primary_speaker_id:'Speaker_1',
       diarization_sensitivity:Math.max(0, Math.min(1, (+$('#o_sensitivity').value || 0) / 100))
     },
-    deepseek_key:$('#hKey').value};
+    deepseek_key:$('#hKey').value, elevenlabs_key:$('#hElevenKey').value,
+    elevenlabs_gender:$('#hGender').value, tts_provider:$('#hTtsProvider').value,
+    separate_speakers:$('#o_separate').checked};
 }
 let saveT=null;
 function saveHome(){
@@ -956,15 +973,18 @@ async function loadMeta(){
   const s=META.settings||{};
   curVoices=Object.assign({}, META.default_voice, s.voices||{});
   QUEUE=(s.queue||[]).map(q=>({path:q.path,region:q.region||null}));
+  const inbound=new URLSearchParams(location.search).get('queue');
+  if(inbound) decodeURIComponent(inbound).split('|').filter(Boolean).forEach(path=>{if(!QUEUE.some(q=>q.path===path))QUEUE.push({path,region:null});});
   const hl=$('#hLang'); hl.innerHTML='';
   META.lang_order.forEach(([code,name])=>{const o=document.createElement('option');o.value=code;o.textContent=name;hl.appendChild(o);});
   hl.value = s.lang || (META.lang_order[0]&&META.lang_order[0][0]);
-  refreshHomeVoices();
+  $('#hGender').value=s.elevenlabs_gender||'female';
   setChk('o_cover', s.cover!==undefined?s.cover:true);
   $('#o_band').value = s.band||18;
   setChk('o_fb',s.fb); setChk('o_keepmusic',s.keepmusic); setChk('o_srt',s.srt);
   setChk('o_burn',s.burn); setChk('o_audioonly',s.audioonly); setChk('o_clone',s.clone);
-  setChk('o_moss',s.moss_tts);
+  $('#hTtsProvider').value=s.tts_provider||(s.moss_tts?'moss':'elevenlabs');
+  setChk('o_separate',s.separate_speakers!==undefined?s.separate_speakers:true);
   setChk('o_gender',s.gender); setChk('o_speakers',s.speakers); setChk('o_scenefx',s.scenefx);
   setChk('o_multimodal',s.multimodal);
   setChk('o_single', s.speaker_override && s.speaker_override.enforce_single_speaker);
@@ -976,18 +996,21 @@ async function loadMeta(){
   $('#o_model').value=s.model||'medium'; $('#o_tone').value=s.tone||'original';
   setMode(inferMode(s));
   $('#hKey').value='';
+  $('#hElevenKey').value='';
   if(s.has_deepseek_key){
     $('#keyHint').textContent = s.deepseek_key_source==='env'
       ? 'DeepSeek key loaded from DEEPSEEK_API_KEY.'
       : 'A legacy saved DeepSeek key is available, but new pasted keys are current-run only. Move it to DEEPSEEK_API_KEY when convenient.';
     $('#keyHint').classList.toggle('warn', s.deepseek_key_source==='legacy_file');
   }
-  renderQueue();
+  renderQueue(); saveHome();
 }
 function syncVoiceModeOptions(){
   const forceSingle = $('#o_single').checked;
   const characterVoices = $('#o_speakers').checked;
-  const moss = $('#o_moss').checked;
+  const moss = $('#hTtsProvider').value==='moss';
+  $('#hGender').disabled=moss; $('#hPreview').disabled=moss; $('#hElevenKey').disabled=moss;
+  $('#mossHint').textContent=moss ? 'MOSS local voice is selected.' : 'ElevenLabs uses the selected natural male/female voice.';
   if(forceSingle){
     $('#o_speakers').checked = false;
     $('#o_gender').checked = false;
@@ -1000,13 +1023,13 @@ function syncVoiceModeOptions(){
   $('#o_lengthfit').disabled = true;
   $('#o_clone').disabled = characterVoices && !moss;
 }
-['o_cover','o_band','o_fb','o_keepmusic','o_srt','o_burn','o_audioonly','o_moss','o_clone','o_gender','o_speakers','o_single','o_sensitivity','o_scenefx','o_reuse','o_multimodal','o_lengthfit','o_model','o_tone','o_rights','hKey','hVoice']
-  .forEach(id=>$('#'+id).addEventListener('change',()=>{ if(id!=='hKey' && id!=='hVoice') markCustom(); saveHome(); }));
+['o_cover','o_band','o_fb','o_keepmusic','o_srt','o_burn','o_audioonly','o_clone','o_gender','o_speakers','o_separate','o_single','o_sensitivity','o_scenefx','o_reuse','o_multimodal','o_lengthfit','o_model','o_tone','o_rights','hKey','hElevenKey','hGender','hTtsProvider']
+  .forEach(id=>$('#'+id).addEventListener('change',()=>{ if(id!=='hKey') markCustom(); saveHome(); }));
 $$('.modeBtn').forEach(b=>b.addEventListener('click',()=>applyMode(b.dataset.mode)));
 $('#o_speakers').addEventListener('change',syncVoiceModeOptions);
 $('#o_single').addEventListener('change',syncVoiceModeOptions);
-$('#o_moss').addEventListener('change',syncVoiceModeOptions);
-$('#hLang').addEventListener('change',()=>{refreshHomeVoices();saveHome();});
+$('#hTtsProvider').addEventListener('change',syncVoiceModeOptions);
+$('#hLang').addEventListener('change',saveHome);
 
 $('#addVids').addEventListener('click',()=>$('#fileInput').click());
 $('#fileInput').addEventListener('change',async e=>{
@@ -1024,12 +1047,24 @@ $('#fileInput').addEventListener('change',async e=>{
   if(added) $('#homeStatus').textContent=`Added ${added} video(s)`;
   e.target.value=''; renderQueue(); saveHome();
 });
+let maskIndex=-1, maskDrag=null;
+function applyMaskRect(region){const r=$('#maskRect');r.style.left=(region[0]*100)+'%';r.style.top=(region[1]*100)+'%';r.style.width=(region[2]*100)+'%';r.style.height=(region[3]*100)+'%';$('#maskWidth').value=Math.round(region[2]*100);$('#maskHeight').value=Math.round(region[3]*100);}
+function currentMaskRect(){const stage=$('#maskStage').getBoundingClientRect(),r=$('#maskRect').getBoundingClientRect();return [Math.max(0,(r.left-stage.left)/stage.width),Math.max(0,(r.top-stage.top)/stage.height),Math.min(1,r.width/stage.width),Math.min(1,r.height/stage.height)];}
+async function openMask(index){maskIndex=index;const q=QUEUE[index],video=$('#maskVideo');$('#maskDialog').showModal();try{const r=await fetch('/api/browser_preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:q.path})});const d=await r.json();if(d.error)throw Error(d.error);video.src=d.url;video.load();video.onloadedmetadata=()=>applyMaskRect(q.region||[.08,.72,.84,.18]);video.onerror=()=>{alert('Preview could not load. Restart Translation Editor and try again.');};}catch(e){alert(e.message||'Could not prepare the video preview.');}}
+$('#maskRect').addEventListener('pointerdown',e=>{if(e.target===$('#maskHandle'))return;maskDrag={mode:'move',x:e.clientX,y:e.clientY,rect:currentMaskRect()};e.currentTarget.setPointerCapture(e.pointerId);e.preventDefault();});
+$('#maskHandle').addEventListener('pointerdown',e=>{maskDrag={mode:'resize',x:e.clientX,y:e.clientY,rect:currentMaskRect()};$('#maskRect').setPointerCapture(e.pointerId);e.preventDefault();});
+$('#maskRect').addEventListener('pointermove',e=>{if(!maskDrag)return;const stage=$('#maskStage').getBoundingClientRect(),dx=(e.clientX-maskDrag.x)/stage.width,dy=(e.clientY-maskDrag.y)/stage.height;let [x,y,w,h]=maskDrag.rect;if(maskDrag.mode==='move'){x=Math.max(0,Math.min(1-w,x+dx));y=Math.max(0,Math.min(1-h,y+dy));}else{w=Math.max(.03,Math.min(1-x,w+dx));h=Math.max(.03,Math.min(1-y,h+dy));}applyMaskRect([x,y,w,h]);});
+$('#maskRect').addEventListener('pointerup',()=>maskDrag=null);
+function resizeMask(){const [x,y,,]=currentMaskRect();const w=Math.max(.03,Math.min(1-x,(+$('#maskWidth').value||3)/100));const h=Math.max(.03,Math.min(1-y,(+$('#maskHeight').value||3)/100));applyMaskRect([x,y,w,h]);}
+$('#maskWidth').addEventListener('input',resizeMask);$('#maskHeight').addEventListener('input',resizeMask);
+$('#maskCancel').addEventListener('click',()=>$('#maskDialog').close());
+$('#maskApply').addEventListener('click',()=>{if(maskIndex>=0){QUEUE[maskIndex].region=currentMaskRect();renderQueue();saveHome();}$('#maskDialog').close();});
 $('#hPreview').addEventListener('click',async()=>{
-  const lang=$('#hLang').value, voice=$('#hVoice').value;
+  const lang=$('#hLang').value;
   $('#homeStatus').textContent='Synthesizing preview…';
   try{
     const d=await (await fetch('/api/voice_preview',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({lang,voice})})).json();
+      body:JSON.stringify({lang,gender:$('#hGender').value,provider:'elevenlabs',elevenlabs_key:$('#hElevenKey').value})})).json();
     if(d.error){$('#homeStatus').textContent=d.error;return;}
     const a=$('#hPrevAudio'); a.src=d.url+'&t='+Date.now(); a.play(); $('#homeStatus').textContent='Ready';
   }catch(e){$('#homeStatus').textContent='Preview failed';}

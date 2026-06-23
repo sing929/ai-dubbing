@@ -38,10 +38,13 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from feedback_storage import FeedbackStorage, ValidationError
 from self_learning_agent import optimize_dub_job_config
+import keyring
+from keyring.errors import KeyringError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(HERE, "_audio_work")
@@ -52,6 +55,27 @@ FEEDBACK_DIR = os.path.join(HERE, "feedback")
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
+ELEVENLABS_URL = "https://api.elevenlabs.io/v1"
+KEYRING_SERVICE = "Douyin Reels Translation Editor"
+DEEPSEEK_KEY_NAME = "deepseek_api_key"
+ELEVENLABS_KEY_NAME = "elevenlabs_api_key"
+ELEVENLABS_DEFAULT_VOICES = {
+    "female": ["21m00Tcm4TlvDq8ikWAM", "AZnzlk1XvdvUeBnXmlld"],
+    "male": ["pNInz6obpgDQGcFmaJgB", "ErXwobaYiN019PkySvjV"],
+}
+
+
+def _secret(name: str) -> str:
+    try:
+        return (keyring.get_password(KEYRING_SERVICE, name) or "").strip()
+    except KeyringError:
+        return ""
+
+
+def _save_secret(name: str, value: str) -> None:
+    clean = value.strip()
+    if clean:
+        keyring.set_password(KEYRING_SERVICE, name, clean)
 
 # Folders the /media endpoint is allowed to serve from (everything else is denied).
 def _safe_roots() -> list[str]:
@@ -89,7 +113,16 @@ SAFE_ROOTS = _safe_roots()
 
 def _allowed(path: str) -> bool:
     ap = os.path.normcase(os.path.abspath(path))
-    return any(ap == r or ap.startswith(r + os.sep) for r in SAFE_ROOTS)
+    roots = list(SAFE_ROOTS)
+    try:
+        settings = json.load(open(SETTINGS, encoding="utf-8"))
+        for item in settings.get("queue", []):
+            queued = item.get("path", "") if isinstance(item, dict) else ""
+            if queued and os.path.isfile(queued):
+                roots.append(os.path.normcase(os.path.abspath(os.path.dirname(queued))))
+    except Exception:
+        pass
+    return any(ap == root or ap.startswith(root + os.sep) for root in roots)
 
 
 # ---------------------------------------------------------------- project data
@@ -146,13 +179,29 @@ def _tr_cache_path(base: str, lang: str) -> str:
 
 
 def _translate_lines(lines: list[str], lang: str) -> list[str]:
-    """Google-translate source lines to `lang`. Best-effort, line by line so one bad
-    line can't blank the rest. Mirrors dub.py's source='auto' approach."""
+    """Translate with saved DeepSeek credentials, falling back to Google only when none exist."""
+    clean_lines = [(line or "").strip() for line in lines]
+    key = _saved_key()
+    if key and any(clean_lines):
+        target = LANG_NAMES.get(lang, lang)
+        system = (
+            f"Translate each input subtitle line into natural spoken {target}. Preserve the exact number "
+            "and order of lines. Keep translations concise enough for video dubbing. Return only the "
+            "translated lines, one per input line, with no numbering or commentary."
+        )
+        reply, error = deepseek(system, "\n".join(clean_lines), key)
+        translated = [line.strip() for line in (reply or "").splitlines()]
+        if error:
+            raise RuntimeError(error)
+        if len(translated) != len(clean_lines):
+            raise RuntimeError("DeepSeek returned a different number of subtitle lines; translation was not applied.")
+        return translated
+
+    # No DeepSeek key: retain the free fallback for first-time setup.
     from deep_translator import GoogleTranslator
     out: list[str] = []
     tgt = "zh-CN" if lang == "zh" else lang
-    for ln in lines:
-        s = (ln or "").strip()
+    for s in clean_lines:
         if not s:
             out.append("")
             continue
@@ -333,6 +382,9 @@ def _saved_key() -> str:
     env = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if env:
         return env
+    saved = _secret(DEEPSEEK_KEY_NAME)
+    if saved:
+        return saved
     for p in (os.path.join(HERE, "_dubapp_settings.json"), os.path.join(WORK, "_jobs.json")):
         try:
             d = json.load(open(p, encoding="utf-8"))
@@ -355,6 +407,33 @@ _NEW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 def _find_ffmpeg() -> str:
     cands = glob.glob(os.path.join(HERE, "ffmpeg*", "bin", "ffmpeg.exe"))
     return cands[0] if cands else "ffmpeg"
+
+
+def browser_preview(path: str) -> str:
+    """Make a lightweight WebM preview that Qt WebEngine can play without H.264 codecs."""
+    if not path or not os.path.isfile(path) or not _allowed(path):
+        raise FileNotFoundError("The selected video is no longer available.")
+    stamp = f"{path}|{os.path.getsize(path)}|{os.path.getmtime(path)}".encode("utf-8")
+    folder = os.path.join(WORK, "browser_previews")
+    os.makedirs(folder, exist_ok=True)
+    output = os.path.join(folder, hashlib.sha1(stamp).hexdigest()[:16] + ".webm")
+    if os.path.isfile(output) and os.path.getsize(output) > 0:
+        return output
+    temporary = output + ".partial.webm"
+    try:
+        os.remove(temporary)
+    except OSError:
+        pass
+    result = subprocess.run(
+        [_find_ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", "-i", path,
+         "-map", "0:v:0", "-map", "0:a?", "-vf", "scale=480:-2", "-c:v", "libvpx", "-deadline", "realtime",
+         "-cpu-used", "8", "-b:v", "700k", "-c:a", "libopus", "-b:a", "64k", temporary],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=_NEW,
+    )
+    if result.returncode or not os.path.isfile(temporary) or os.path.getsize(temporary) < 1024:
+        raise RuntimeError(result.stderr.strip() or "Could not prepare the browser preview.")
+    os.replace(temporary, output)
+    return output
 
 
 def _base_cfg() -> dict:
@@ -387,7 +466,7 @@ def _pick_video() -> str:
     )
     try:
         r = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                           text=True, timeout=300, creationflags=_NEW)
+                           text=True, encoding="utf-8", errors="replace", timeout=300, creationflags=_NEW)
         return r.stdout.strip()
     except Exception:
         return ""
@@ -419,23 +498,31 @@ def load_settings() -> dict:
     data.pop("deepseek_key", None)
     data["has_deepseek_key"] = bool(_saved_key())
     data["deepseek_key_source"] = "env" if os.environ.get("DEEPSEEK_API_KEY", "").strip() else (
-        "legacy_file" if _saved_key() else "")
+        "keychain" if _secret(DEEPSEEK_KEY_NAME) else ("legacy_file" if _saved_key() else ""))
+    data["has_elevenlabs_key"] = bool(_secret(ELEVENLABS_KEY_NAME))
     return data
 
 
 def save_settings(data: dict) -> dict:
     cur = load_settings()
+    try:
+        _save_secret(DEEPSEEK_KEY_NAME, str((data or {}).get("deepseek_key") or ""))
+        _save_secret(ELEVENLABS_KEY_NAME, str((data or {}).get("elevenlabs_key") or ""))
+    except KeyringError as error:
+        raise RuntimeError("Windows Credential Manager is unavailable; API keys could not be saved locally.") from error
     cur.update(data or {})
     try:
         # Do not persist API keys in plaintext settings. A pasted key can still be
         # used for the current job via _start_job(), but durable config should use
         # the DEEPSEEK_API_KEY environment variable.
         to_write = dict(cur)
-        for k in ("deepseek_key", "has_deepseek_key", "deepseek_key_source"):
+        for k in ("deepseek_key", "elevenlabs_key", "has_deepseek_key", "deepseek_key_source", "has_elevenlabs_key"):
             to_write.pop(k, None)
         json.dump(to_write, open(SETTINGS, "w", encoding="utf-8"), ensure_ascii=False)
     except Exception as e:
         print(f"  [warn] could not save settings: {e}", flush=True)
+    cur.pop("deepseek_key", None)
+    cur.pop("elevenlabs_key", None)
     return cur
 
 
@@ -519,7 +606,7 @@ def _pick_videos() -> list[str]:
     )
     try:
         r = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                           text=True, timeout=300, creationflags=_NEW)
+                           text=True, encoding="utf-8", errors="replace", timeout=300, creationflags=_NEW)
         return json.loads(r.stdout.strip() or "[]")
     except Exception:
         return []
@@ -537,13 +624,17 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
         default_voice = {}
     lang = s.get("lang") or "en"
     voices = s.get("voices") or {}
-    moss_tts = bool(s.get("moss_tts"))
-    speakers = bool(s.get("speakers"))
+    tts_provider = str(s.get("tts_provider") or "elevenlabs")
+    moss_tts = tts_provider == "moss"
+    separate_speakers = bool(s.get("separate_speakers", True))
+    speakers = bool(s.get("speakers")) or separate_speakers
     speaker_override = s.get("speaker_override") if isinstance(s.get("speaker_override"), dict) else {}
     enforce_single = bool(speaker_override.get("enforce_single_speaker"))
     preset = s.get("preset") or ""
     rights_mode = s.get("rights_mode") or ""
     facebook_reels = preset == "facebook_reels"
+    elevenlabs_key = (s.get("elevenlabs_key") or "").strip() or _secret(ELEVENLABS_KEY_NAME)
+    using_elevenlabs = tts_provider == "elevenlabs"
     if facebook_reels:
         speakers = True
         rights_mode = rights_mode or "owned_or_licensed"
@@ -563,9 +654,9 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
         "srt": bool(s.get("srt")) or facebook_reels, "naming": "firstline",
         "burn": bool(s.get("burn")) or facebook_reels,
         "tone": s.get("tone", "original"), "audioonly": bool(s.get("audioonly")),
-        "clone": bool(s.get("clone")) and (moss_tts or not (speakers or facebook_reels)),
+        "clone": False if using_elevenlabs else bool(s.get("clone")) and (moss_tts or not (speakers or facebook_reels)),
         "moss_tts": moss_tts,
-        "gender": gender,
+        "gender": gender or separate_speakers,
         "speakers": speakers, "scenefx": bool(s.get("scenefx")),
         "reuse_analysis": bool(s.get("reuse_analysis", True)),
         # Disabled from the web UI: per-line DeepSeek length fitting can hang on
@@ -582,6 +673,15 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
         },
         "deepseek_key": "",
         "_runtime_deepseek_key": (s.get("deepseek_key") or "").strip() or _saved_key(),
+        "_runtime_elevenlabs_key": elevenlabs_key,
+        "elevenlabs_voice_id": elevenlabs_voice_for_gender(
+            str(s.get("elevenlabs_key") or "") or _secret(ELEVENLABS_KEY_NAME),
+            str(s.get("elevenlabs_gender") or "female"),
+        ),
+        "elevenlabs_voice_pools": {
+            "female": elevenlabs_voice_pool(elevenlabs_key, "female"),
+            "male": elevenlabs_voice_pool(elevenlabs_key, "male"),
+        } if using_elevenlabs else {},
         "voices": {lang: voices.get(lang) or default_voice.get(lang, "")},
     }
     return optimize_dub_job_config(cfg, os.path.join(HERE, "system_memory.json"))
@@ -603,6 +703,61 @@ def voice_preview(lang: str, voice: str) -> str | None:
         return out if os.path.exists(out) else None
     except Exception as e:
         print(f"  [warn] voice preview failed: {e}", flush=True)
+        return None
+
+
+def elevenlabs_voices(api_key: str) -> list[dict]:
+    key = api_key.strip() or _secret(ELEVENLABS_KEY_NAME)
+    if not key:
+        raise ValueError("Save an ElevenLabs API key first.")
+    request = urllib.request.Request(f"{ELEVENLABS_URL}/voices", headers={"xi-api-key": key})
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:160]
+        raise RuntimeError(f"ElevenLabs returned HTTP {error.code}: {detail}") from error
+    return [
+        {"id": str(voice.get("voice_id", "")), "name": str(voice.get("name", "Unnamed voice")),
+         "category": str(voice.get("category", "")),
+         "gender": str((voice.get("labels") or {}).get("gender", "")).casefold()}
+        for voice in payload.get("voices", []) if voice.get("voice_id")
+    ]
+
+
+def elevenlabs_voice_for_gender(api_key: str, gender: str) -> str:
+    return elevenlabs_voice_pool(api_key, gender)[0]
+
+
+def elevenlabs_voice_pool(api_key: str, gender: str) -> list[str]:
+    desired = "male" if gender.casefold() == "male" else "female"
+    try:
+        matched = [str(voice["id"]) for voice in elevenlabs_voices(api_key) if voice.get("gender") == desired]
+        if matched:
+            return matched
+    except (ValueError, RuntimeError, urllib.error.URLError):
+        pass
+    return ELEVENLABS_DEFAULT_VOICES[desired]
+
+
+def elevenlabs_preview(text: str, voice_id: str, api_key: str) -> str | None:
+    key = api_key.strip() or _secret(ELEVENLABS_KEY_NAME)
+    if not key or not voice_id:
+        return None
+    body = json.dumps({"text": text, "model_id": "eleven_multilingual_v2"}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{ELEVENLABS_URL}/text-to-speech/{urllib.parse.quote(voice_id)}", data=body,
+        headers={"xi-api-key": key, "Content-Type": "application/json", "Accept": "audio/mpeg"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            audio = response.read()
+        out = os.path.join(WORK, "_elevenlabs_preview.mp3")
+        with open(out, "wb") as file:
+            file.write(audio)
+        return out
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as error:
+        print(f"  [warn] ElevenLabs preview failed: {error}", flush=True)
         return None
 
 
@@ -642,6 +797,9 @@ def _start_job(cfg: dict, label: str) -> tuple[bool, str | None]:
         return False, "A dub is already running."
     jobs_path = os.path.join(WORK, "_jobs_editor.json")
     runtime_key = (cfg.pop("_runtime_deepseek_key", "") or "").strip()
+    elevenlabs_key = (cfg.pop("_runtime_elevenlabs_key", "") or "").strip()
+    elevenlabs_voice_id = (cfg.pop("elevenlabs_voice_id", "") or "").strip()
+    elevenlabs_voice_pools = cfg.pop("elevenlabs_voice_pools", {})
     if runtime_key:
         cfg["deepseek_key"] = ""
     json.dump(cfg, open(jobs_path, "w", encoding="utf-8"), ensure_ascii=False)
@@ -649,6 +807,10 @@ def _start_job(cfg: dict, label: str) -> tuple[bool, str | None]:
     env = os.environ.copy()
     if runtime_key:
         env["DEEPSEEK_API_KEY"] = runtime_key
+    if elevenlabs_key and elevenlabs_voice_id:
+        env["ELEVENLABS_API_KEY"] = elevenlabs_key
+        env["ELEVENLABS_VOICE_ID"] = elevenlabs_voice_id
+        env["ELEVENLABS_VOICE_POOLS"] = json.dumps(elevenlabs_voice_pools)
     if cfg.get("moss_tts"):
         env["MOSS_TTS_ENABLE"] = "1"
         env.setdefault("MOSS_TTS_REPO", os.path.abspath(os.path.join(HERE, "..", "MOSS-TTS-Nano")))
@@ -673,6 +835,7 @@ def _start_job(cfg: dict, label: str) -> tuple[bool, str | None]:
 # ---------------------------------------------------------------- HTTP handler
 class Handler(BaseHTTPRequestHandler):
     server_version = "DubEditor/1.0"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):  # quiet
         pass
@@ -704,7 +867,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_html()
             if u.path == "/api/projects":
                 return self._json({"projects": list_projects(), "langs": _job_langs(),
-                                   "lang_names": LANG_NAMES, "has_key": bool(_saved_key())})
+                                   "lang_names": LANG_NAMES, "has_key": bool(_saved_key()),
+                                   "has_elevenlabs": bool(_secret(ELEVENLABS_KEY_NAME))})
             if u.path == "/api/project":
                 pid = q.get("id", [""])[0]
                 lang = q.get("lang", ["en"])[0]
@@ -803,12 +967,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"settings": save_settings(self._body())})
             if u.path == "/api/add_videos":
                 return self._json({"paths": _pick_videos()})
+            if u.path == "/api/browser_preview":
+                preview = browser_preview(str(self._body().get("path") or ""))
+                return self._json({"url": "/media?path=" + urllib.parse.quote(preview)})
             if u.path == "/api/voice_preview":
                 b = self._body()
-                out = voice_preview(b.get("lang", "en"), b.get("voice", ""))
+                out = (elevenlabs_preview(
+                           b.get("text", "Hello, this is a voice preview."),
+                           elevenlabs_voice_for_gender(b.get("elevenlabs_key", ""), b.get("gender", "female")),
+                           b.get("elevenlabs_key", ""),
+                       ) if b.get("provider") == "elevenlabs"
+                       else voice_preview(b.get("lang", "en"), b.get("voice", "")))
                 if not out:
-                    return self._json({"error": "Preview failed (edge-tts/voice?)."}, 400)
+                    return self._json({"error": "Voice preview failed. Check the selected voice and API key."}, 400)
                 return self._json({"url": "/media?path=" + urllib.parse.quote(out)})
+            if u.path == "/api/elevenlabs/voices":
+                b = self._body()
+                return self._json({"voices": elevenlabs_voices(str(b.get("elevenlabs_key") or ""))})
             if u.path == "/api/stop":
                 _stop_job()
                 return self._json({"ok": True})
@@ -824,6 +999,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "Add at least one video."}, 400)
                 if not (s.get("lang")):
                     return self._json({"error": "Pick a target language."}, 400)
+                if (s.get("tts_provider") or "elevenlabs") == "elevenlabs" and not (
+                    (s.get("elevenlabs_key") or "").strip() or _secret(ELEVENLABS_KEY_NAME)
+                ):
+                    return self._json({"error": "Save an ElevenLabs API key before dubbing. The app will not fall back to Edge voices."}, 400)
                 save_settings({**s, "queue": queue})
                 ok, err = _start_job(build_dub_cfg(s, queue),
                                      f"Dubbing {len(queue)} video(s) → {s.get('lang')}")
@@ -916,7 +1095,7 @@ def _kill_port(port: int) -> None:
         return
     try:
         out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
-                             text=True, creationflags=_NEW).stdout
+                             text=True, encoding="utf-8", errors="replace", creationflags=_NEW).stdout
     except Exception:
         return
     me = str(os.getpid())
