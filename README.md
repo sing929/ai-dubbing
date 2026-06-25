@@ -61,6 +61,15 @@ the ONNX CPU backend for supported languages and can clone from the original voi
 when **Clone original speaker's voice** is also enabled. First use downloads the
 ONNX model files into `E:\dub\MOSS-TTS-Nano\models`; after that it runs locally.
 
+## Optional: Confucius4-TTS local voice clone
+
+Choose **Use Confucius4-TTS local voice clone (CUDA)** in the standalone app to
+use the original dialogue as the reference voice. It supports Chinese, English,
+Japanese, Korean, German, French, Spanish, Indonesian, Italian, Thai,
+Portuguese, Russian, Malay, and Vietnamese. The checkout lives at
+`E:\dub\Confucius4-TTS`; follow its upstream Python 3.10 / CUDA 12.6 setup and
+download its model checkpoints before using this option.
+
 ## Optional: sound like the original speaker
 
 Needs an NVIDIA GPU and a one-time setup. Follow

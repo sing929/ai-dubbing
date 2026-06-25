@@ -250,13 +250,13 @@
           <div class="cardhead">Language &amp; voice</div>
           <div class="frow">
             <label>Target language</label><select id="hLang"></select>
-            <label>TTS engine</label><select id="hTtsProvider"><option value="elevenlabs">ElevenLabs</option><option value="moss">MOSS local</option></select>
+            <label>TTS engine</label><select id="hTtsProvider"><option value="elevenlabs">ElevenLabs</option><option value="moss">MOSS local</option><option value="confucius">Confucius4-TTS local</option></select>
             <label>Natural voice</label><select id="hGender"><option value="female">Female</option><option value="male">Male</option></select>
             <button class="btn" id="hPreview">▶ Preview</button>
             <audio id="hPrevAudio" style="display:none"></audio>
           </div>
           <div class="frow" style="margin-top:12px">
-            <label id="mossHint">MOSS runs locally. ElevenLabs uses the selected natural male/female voice.</label>
+            <label id="mossHint">Choose a local or cloud TTS engine. Confucius4-TTS clones the source voice locally.</label>
             <label title="Detect speakers and assign a distinct voice to each person."><input type="checkbox" id="o_separate" checked> Separate multiple speakers</label>
             <label title="With MOSS enabled this clones from the original voice on CPU. Without MOSS it uses the older OpenVoice GPU path."><input type="checkbox" id="o_clone"> Clone original speaker's voice</label>
           </div>
@@ -267,7 +267,6 @@
           <div class="modeGrid">
             <button class="modeBtn" data-mode="fast"><strong>Fast Draft</strong><span>Quick translation and voice for checking the cut.</span></button>
             <button class="modeBtn" data-mode="quality"><strong>Best Quality</strong><span>Music bed, character voices, timing help, safer defaults.</span></button>
-            <button class="modeBtn" data-mode="reels"><strong>Facebook Reels</strong><span>Vertical export with burned captions and licensed-source flag.</span></button>
           </div>
           <div class="frow" style="margin-top:12px">
             <label title="Use this when the source video has exactly one speaker. It collapses diarization and AI casting so the output keeps one voice profile."><input type="checkbox" id="o_single"> Force one speaker</label>
@@ -281,16 +280,15 @@
             <div class="opts">
             <label title="Blur over the original burned-in subtitle area."><input type="checkbox" id="o_cover"> Cover original subtitles</label>
             <label class="inline" title="Fallback blur height when no box is drawn.">Bottom strip % <input type="number" id="o_band" min="8" max="40" value="18" style="width:60px"></label>
-            <label title="Reframe to vertical 1080×1920 with blurred fill."><input type="checkbox" id="o_fb"> Make 9:16 Facebook-ready</label>
-            <label title="Keep the original music bed under the dub (Demucs, slower)."><input type="checkbox" id="o_keepmusic"> Keep original music (slower)</label>
+            <label title="The translated-video workflow always preserves the original music bed (Demucs)."><input type="checkbox" id="o_keepmusic" checked disabled> Preserve original music</label>
             <label title="Save a translated .srt next to each output."><input type="checkbox" id="o_srt"> Also save subtitle (.srt)</label>
             <label title="Hard-code the translated text onto the video."><input type="checkbox" id="o_burn"> Burn subtitles onto video</label>
             <label title="Export only the dubbed audio (.wav), no video render."><input type="checkbox" id="o_audioonly"> Dubbed audio only (no video)</label>
             <label title="Male voice for male lines, female for female (by pitch)."><input type="checkbox" id="o_gender"> Auto male/female voices</label>
             <label title="Off by default. Enable only for videos with multiple real speakers."><input type="checkbox" id="o_speakers"> Distinct voice per character</label>
             <label class="inline" title="0 is most conservative; 100 allows easier speaker splitting.">Speaker split sensitivity <input type="number" id="o_sensitivity" min="0" max="100" value="35" style="width:68px"></label>
-            <label title="Keep panting/shouts from gaps (Demucs), drop music."><input type="checkbox" id="o_scenefx"> Keep scene sounds</label>
-            <label title="Cache transcription so other languages dub fast."><input type="checkbox" id="o_reuse" checked> Fast re-dub (reuse transcription)</label>
+            <label title="The translated-video workflow always preserves panting, shouts, and other scene sounds from the original vocal track."><input type="checkbox" id="o_scenefx" checked disabled> Preserve sound effects</label>
+            <label title="The translated-video workflow always reuses a valid transcription from the same source video."><input type="checkbox" id="o_reuse" checked disabled> Fast re-dub (reuse transcription)</label>
             <label title="Sample frames for visual context and timing anchors. With DeepSeek key, uses vision analysis; without one, uses local timing anchors."><input type="checkbox" id="o_multimodal"> Video-frame context + sync anchors</label>
             <label title="Disabled in the UI for now: this can hang on long scripts."><input type="checkbox" id="o_lengthfit" disabled> Fit translated line length</label>
             <label class="inline" title="Whisper model size.">Accuracy <select id="o_model"><option>tiny</option><option>base</option><option>small</option><option selected>medium</option></select></label>
@@ -829,7 +827,7 @@ async function pollJob(){
   if(pct!=null)$('#jobBar').style.width=Math.max(3,pct)+'%';
   if(!d.running && d.done){
     clearInterval(jobTimer); jobTimer=null;
-    const ok=lines.some(l=>l.startsWith('__OUT__'));
+    const ok=(d.outputs||[]).length>0 || lines.some(l=>l.startsWith('__OUT__'));
     $('#jobStage').textContent= ok?'Done ✓':'Finished (check the log)';
     $('#jobBar').style.width='100%'; $('#jobClose').style.display='inline-flex';
     $('#stopBtn').disabled=true; $('#homeStatus').textContent= ok?'Dub complete ✓':'Finished';
@@ -866,24 +864,16 @@ function applyMode(mode, persist=true){
   setMode(mode);
   if(mode==='fast'){
     setChk('o_single', true);
-    setChk('o_rights', false); setChk('o_cover', true); setChk('o_fb', false);
-    setChk('o_keepmusic', false); setChk('o_srt', false); setChk('o_burn', false);
+    setChk('o_rights', false); setChk('o_cover', true);
+    setChk('o_keepmusic', true); setChk('o_srt', false); setChk('o_burn', false);
     setChk('o_audioonly', false); setChk('o_clone', false); setChk('o_gender', false);
-    setChk('o_speakers', false); setChk('o_scenefx', false); setChk('o_reuse', true);
+    setChk('o_speakers', false); setChk('o_scenefx', true); setChk('o_reuse', true);
     setChk('o_multimodal', false); setChk('o_lengthfit', false); $('#o_sensitivity').value='20';
     $('#o_model').value='small'; $('#o_tone').value='natural';
   }else if(mode==='quality'){
     setChk('o_single', true);
-    setChk('o_rights', false); setChk('o_cover', true); setChk('o_fb', false);
+    setChk('o_rights', false); setChk('o_cover', true);
     setChk('o_keepmusic', true); setChk('o_srt', true); setChk('o_burn', false);
-    setChk('o_audioonly', false); setChk('o_clone', false); setChk('o_gender', false);
-    setChk('o_speakers', false); setChk('o_scenefx', false); setChk('o_reuse', true);
-    setChk('o_multimodal', true); setChk('o_lengthfit', false); $('#o_sensitivity').value='0';
-    $('#o_model').value='medium'; $('#o_tone').value='original';
-  }else if(mode==='reels'){
-    setChk('o_single', true);
-    setChk('o_rights', true); setChk('o_cover', true); setChk('o_fb', true);
-    setChk('o_keepmusic', true); setChk('o_srt', true); setChk('o_burn', true);
     setChk('o_audioonly', false); setChk('o_clone', false); setChk('o_gender', false);
     setChk('o_speakers', false); setChk('o_scenefx', true); setChk('o_reuse', true);
     setChk('o_multimodal', true); setChk('o_lengthfit', false); $('#o_sensitivity').value='0';
@@ -891,15 +881,13 @@ function applyMode(mode, persist=true){
   }
   syncVoiceModeOptions();
   $('#homeStatus').textContent = mode==='fast' ? 'Fast Draft mode applied'
-    : mode==='quality' ? 'Best Quality mode applied'
-    : mode==='reels' ? 'Facebook Reels mode applied' : 'Custom mode';
+    : mode==='quality' ? 'Best Quality mode applied' : 'Custom mode';
   if(persist) saveHome();
 }
 function inferMode(s){
-  if(s.mode) return s.mode;
-  if(s.preset==='facebook_reels' || (s.rights_mode==='owned_or_licensed' && s.fb && s.burn && s.srt)) return 'reels';
+  if(s.mode==='fast' || s.mode==='quality') return s.mode;
   if(s.keepmusic && s.speakers && s.gender) return 'quality';
-  return 'fast';
+  return 'quality';
 }
 function markCustom(){
   if(!META) return;
@@ -924,22 +912,21 @@ function collectSettings(){
   const code=$('#hLang').value;
   const characterVoices = $('#o_speakers').checked;
   const forceSingle = $('#o_single').checked;
-  const moss = $('#hTtsProvider').value==='moss';
-  if(characterVoices && !moss) $('#o_clone').checked = false;
+  const localCloneTts = ['moss','confucius'].includes($('#hTtsProvider').value);
+  if(characterVoices && !localCloneTts) $('#o_clone').checked = false;
   const mode = $('#hMode').value || 'quality';
-  const rightsOk = $('#o_rights').checked || mode==='reels';
-  const preset = mode==='reels' ? 'facebook_reels' : '';
+  const rightsOk = $('#o_rights').checked;
   return {lang:code, mode:mode, voices:curVoices,
-    cover:$('#o_cover').checked, band:+$('#o_band').value, fb:$('#o_fb').checked,
+    cover:$('#o_cover').checked, band:+$('#o_band').value, fb:false,
     keepmusic:$('#o_keepmusic').checked, srt:$('#o_srt').checked, burn:$('#o_burn').checked,
-    audioonly:$('#o_audioonly').checked, clone:(moss || !characterVoices) && $('#o_clone').checked, moss_tts:moss, gender:$('#o_gender').checked && !forceSingle,
+    audioonly:$('#o_audioonly').checked, clone:(localCloneTts || !characterVoices) && $('#o_clone').checked, moss_tts:$('#hTtsProvider').value==='moss', confucius_tts:$('#hTtsProvider').value==='confucius', gender:$('#o_gender').checked && !forceSingle,
     speakers:($('#o_speakers').checked || $('#o_separate').checked) && !forceSingle, scenefx:$('#o_scenefx').checked,
     reuse_analysis:$('#o_reuse').checked, length_fit:false,
     multimodal:$('#o_multimodal').checked,
     multimodal_vision:true,
     multimodal_fps:1.0,
     model:$('#o_model').value, tone:$('#o_tone').value,
-    preset:preset, rights_mode:rightsOk?'owned_or_licensed':'',
+    preset:'', rights_mode:rightsOk?'owned_or_licensed':'',
     speaker_override:{
       enforce_single_speaker:forceSingle,
       primary_speaker_id:'Speaker_1',
@@ -981,16 +968,16 @@ async function loadMeta(){
   $('#hGender').value=s.elevenlabs_gender||'female';
   setChk('o_cover', s.cover!==undefined?s.cover:true);
   $('#o_band').value = s.band||18;
-  setChk('o_fb',s.fb); setChk('o_keepmusic',s.keepmusic); setChk('o_srt',s.srt);
+  setChk('o_keepmusic', true); setChk('o_srt',s.srt);
   setChk('o_burn',s.burn); setChk('o_audioonly',s.audioonly); setChk('o_clone',s.clone);
   $('#hTtsProvider').value=s.tts_provider||(s.moss_tts?'moss':'elevenlabs');
   setChk('o_separate',s.separate_speakers!==undefined?s.separate_speakers:true);
-  setChk('o_gender',s.gender); setChk('o_speakers',s.speakers); setChk('o_scenefx',s.scenefx);
+  setChk('o_gender',s.gender); setChk('o_speakers',s.speakers); setChk('o_scenefx',true);
   setChk('o_multimodal',s.multimodal);
   setChk('o_single', s.speaker_override && s.speaker_override.enforce_single_speaker);
   $('#o_sensitivity').value = Math.round(((s.speaker_override && s.speaker_override.diarization_sensitivity) ?? 0.35) * 100);
   syncVoiceModeOptions();
-  setChk('o_reuse', s.reuse_analysis!==undefined?s.reuse_analysis:true);
+  setChk('o_reuse', true);
   setChk('o_lengthfit', s.length_fit);
   setChk('o_rights', s.rights_mode==='owned_or_licensed');
   $('#o_model').value=s.model||'medium'; $('#o_tone').value=s.tone||'original';
@@ -1008,22 +995,23 @@ async function loadMeta(){
 function syncVoiceModeOptions(){
   const forceSingle = $('#o_single').checked;
   const characterVoices = $('#o_speakers').checked;
-  const moss = $('#hTtsProvider').value==='moss';
-  $('#hGender').disabled=moss; $('#hPreview').disabled=moss; $('#hElevenKey').disabled=moss;
-  $('#mossHint').textContent=moss ? 'MOSS local voice is selected.' : 'ElevenLabs uses the selected natural male/female voice.';
+  const provider = $('#hTtsProvider').value;
+  const localCloneTts = ['moss','confucius'].includes(provider);
+  $('#hGender').disabled=localCloneTts; $('#hPreview').disabled=localCloneTts; $('#hElevenKey').disabled=localCloneTts;
+  $('#mossHint').textContent=provider==='confucius' ? 'Confucius4-TTS is selected: it uses the matching original line to retain the speaker tone and emotion, and needs its local CUDA setup.' : provider==='moss' ? 'MOSS local voice is selected.' : 'ElevenLabs uses the selected natural male/female voice.';
   if(forceSingle){
     $('#o_speakers').checked = false;
     $('#o_gender').checked = false;
   }
-  if(characterVoices && !moss) $('#o_clone').checked = false;
+  if(characterVoices && !localCloneTts) $('#o_clone').checked = false;
   $('#o_speakers').disabled = forceSingle;
   $('#o_gender').disabled = forceSingle;
   $('#o_sensitivity').disabled = forceSingle;
   $('#o_lengthfit').checked = false;
   $('#o_lengthfit').disabled = true;
-  $('#o_clone').disabled = characterVoices && !moss;
+  $('#o_clone').disabled = characterVoices && !localCloneTts;
 }
-['o_cover','o_band','o_fb','o_keepmusic','o_srt','o_burn','o_audioonly','o_clone','o_gender','o_speakers','o_separate','o_single','o_sensitivity','o_scenefx','o_reuse','o_multimodal','o_lengthfit','o_model','o_tone','o_rights','hKey','hElevenKey','hGender','hTtsProvider']
+['o_cover','o_band','o_keepmusic','o_srt','o_burn','o_audioonly','o_clone','o_gender','o_speakers','o_separate','o_single','o_sensitivity','o_scenefx','o_reuse','o_multimodal','o_lengthfit','o_model','o_tone','o_rights','hKey','hElevenKey','hGender','hTtsProvider']
   .forEach(id=>$('#'+id).addEventListener('change',()=>{ if(id!=='hKey') markCustom(); saveHome(); }));
 $$('.modeBtn').forEach(b=>b.addEventListener('click',()=>applyMode(b.dataset.mode)));
 $('#o_speakers').addEventListener('change',syncVoiceModeOptions);

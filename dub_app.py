@@ -265,6 +265,7 @@ class DubApp:
         self.tkimg = None
         self.stage_start = 0.0
         self.error_lines: list[str] = []
+        self.output_count = 0
         self._preview_token = 0
         # A/B preview (Original vs dubbed audio, played through bundled ffplay)
         self.ffplay = os.path.join(os.path.dirname(self.ffmpeg), "ffplay.exe")
@@ -302,6 +303,7 @@ class DubApp:
                 "tone": self.tone.get(), "audioonly": self.audioonly.get(),
                 "clone": self.clone.get(),
                 "moss_tts": self.moss_tts.get(),
+                "confucius_tts": self.confucius_tts.get(),
                 "gender": self.gender.get(),
                 "speakers": self.speakers.get(),
                 "speaker_override": {
@@ -584,6 +586,13 @@ class DubApp:
                           "It can clone from the original voice when Clone is enabled, runs on CPU, "
                           "and falls back to the normal voice if MOSS is not ready. First use may "
                           "download the MOSS ONNX model files.")
+        self.confucius_tts = tk.BooleanVar(value=s.get("confucius_tts", False))
+        cb_confucius = ttk.Checkbutton(opt, text="Use Confucius4-TTS local voice clone (CUDA)",
+                                       variable=self.confucius_tts)
+        cb_confucius.pack(anchor="w", padx=8)
+        _Tooltip(cb_confucius, "Use Confucius4-TTS to preserve the original speaker's voice across languages. "
+                              "It requires the sibling Confucius4-TTS checkout, its model checkpoints, and a CUDA setup. "
+                              "If it is not ready, the app falls back to the normal voice.")
         self.gender = tk.BooleanVar(value=s.get("gender", False))
         cb_gender = ttk.Checkbutton(opt, text="Auto male/female voices (match each speaker's gender)",
                                     variable=self.gender)
@@ -1354,6 +1363,7 @@ class DubApp:
             return
         self._save_settings()
         self.error_lines = []
+        self.output_count = 0
         os.makedirs(OUT, exist_ok=True)
         os.makedirs(WORK, exist_ok=True)
         videos = []
@@ -1372,8 +1382,9 @@ class DubApp:
                "srt": self.srt.get() or reels, "naming": "firstline",
                "burn": self.burn.get() or reels,
                "tone": self.tone.get(), "audioonly": self.audioonly.get(),
-               "clone": self.clone.get() and (self.moss_tts.get() or not (self.speakers.get() or reels)),
+               "clone": self.clone.get() and ((self.moss_tts.get() or self.confucius_tts.get()) or not (self.speakers.get() or reels)),
                "moss_tts": self.moss_tts.get(),
+               "confucius_tts": self.confucius_tts.get(),
                "gender": (self.gender.get() or reels) and not self.single_speaker.get(),
                "speakers": (self.speakers.get() or reels) and not self.single_speaker.get(),
                "scenefx": self.scenefx.get(),
@@ -1424,6 +1435,12 @@ class DubApp:
             if self.moss_tts.get():
                 env["MOSS_TTS_ENABLE"] = "1"
                 env.setdefault("MOSS_TTS_REPO", os.path.abspath(os.path.join(BASE, "..", "MOSS-TTS-Nano")))
+            if self.confucius_tts.get():
+                env["CONFUCIUS_TTS_ENABLE"] = "1"
+                env.setdefault("CONFUCIUS_TTS_REPO", os.path.abspath(os.path.join(BASE, "..", "Confucius4-TTS")))
+                vendor = os.path.join(BASE, "_vendor", "confucius")
+                if os.path.isdir(vendor):
+                    env["PYTHONPATH"] = vendor + os.pathsep + env.get("PYTHONPATH", "")
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, bufsize=1, encoding="utf-8", errors="replace",
                                  creationflags=_NOWIN, env=env)
@@ -1448,6 +1465,8 @@ class DubApp:
                     else:
                         self.q.put(("log", line + "\n"))
             p.wait()
+            if p.returncode and not self.cancel:
+                self.q.put(("err", f"Worker exited with code {p.returncode}.\n"))
             self.proc = None
         except Exception as e:
             self.q.put(("err", f"ERROR: {e}\n"))
@@ -1489,6 +1508,8 @@ class DubApp:
                         self.queue[idx]["status"] = "working" if kind == "file" else "done"
                         self._refresh_queue()
                 elif kind == "out":
+                    if val[1] and os.path.exists(val[1]):
+                        self.output_count += 1
                     self._ab_add(val[0], val[1])
                 elif kind == "done":
                     self._on_run_done()
@@ -1510,12 +1531,16 @@ class DubApp:
         self.bar["value"] = 100
         self.pct_lbl.config(text="100%")
         n_done = sum(1 for it in self.queue if it["status"] == "done")
+        if self.output_count == 0:
+            self.error_lines.append("No dubbed output file was created.")
         if self.error_lines:
             sample = "\n".join(self.error_lines[:5])
             messagebox.showwarning("Finished with errors",
-                                   f"{n_done} video(s) finished. Some errors were logged:\n\n{sample}")
+                                   f"{n_done} video(s) finished, {self.output_count} output file(s) created."
+                                   f"\n\nSome errors were logged:\n\n{sample}")
         else:
-            messagebox.showinfo("Done", f"All {n_done} video(s) dubbed.\nOpening the output folder.")
+            messagebox.showinfo("Done", f"All {n_done} video(s) dubbed.\n"
+                                f"{self.output_count} output file(s) created.\nOpening the output folder.")
         self._open_out()
 
     def _open_out(self):

@@ -500,14 +500,11 @@ def ensure_bed(video: str, base: str, work: str, ffmpeg: str) -> tuple[str | Non
     stem = os.path.join(work, base + ".wav")
     run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
          "-i", video, "-vn", "-ac", "2", "-ar", "44100", stem])
-    try:
-        import torchcodec  # noqa: F401 - verifies Demucs can save audio through torchaudio.
-    except Exception:
-        print("  Demucs skipped: this Python environment lacks a compatible shared-FFmpeg TorchCodec build.", flush=True)
-        print("  Using the extracted source track for speaker detection; output will be voice-only.", flush=True)
-        return None, stem if os.path.exists(stem) else None
     print("  separating voice/music with Demucs (first run downloads ~80MB model)...")
-    subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-o", work, stem])
+    result = subprocess.run(
+        [sys.executable, "-m", "demucs", "--two-stems", "vocals", "-o", work, stem],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
     if os.path.exists(bed):
         try:
             with open(sig_path, "w", encoding="utf-8") as f:
@@ -515,7 +512,16 @@ def ensure_bed(video: str, base: str, work: str, ffmpeg: str) -> tuple[str | Non
         except Exception:
             pass
         return bed, (vocals if os.path.exists(vocals) else None)
-    print("  Demucs unavailable; original music will be dropped (voice-only dub).")
+    if result.returncode:
+        print(f"  Demucs failed with exit code {result.returncode}; original music will be dropped.", flush=True)
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        summary = next((line.strip() for line in detail if "Could not load libtorchcodec" in line), "")
+        if not summary:
+            summary = next((line.strip() for line in detail if line.strip()), "")
+        if summary:
+            print(f"  Demucs detail: {summary[:180]}", flush=True)
+    else:
+        print("  Demucs unavailable; original music will be dropped (voice-only dub).", flush=True)
     return None, None
 
 
@@ -1534,6 +1540,38 @@ def build_speaker_refs(vocals: str, segs: list[dict], labels: list[int],
     return refs
 
 
+def build_segment_style_refs(vocals: str, segs: list[dict], work_dir: str) -> dict[int, str]:
+    """Create short per-line voice references for expressive zero-shot TTS.
+
+    A full-video prompt preserves identity but flattens the local delivery.  Each
+    subtitle line gets its own lightly padded source-vocal reference so a local
+    model can condition on the original pace, energy, and emotion for that line.
+    """
+    try:
+        source = AudioSegment.from_file(vocals)
+    except Exception:
+        return {}
+    refs: dict[int, str] = {}
+    minimum_ms = 450
+    for index, segment in enumerate(segs):
+        start = max(0, int(float(segment.get("start", 0.0)) * 1000) - 220)
+        end = min(len(source), int(float(segment.get("end", 0.0)) * 1000) + 260)
+        if end - start < minimum_ms:
+            extra = (minimum_ms - (end - start) + 1) // 2
+            start = max(0, start - extra)
+            end = min(len(source), end + extra)
+        if end - start < 180:
+            continue
+        path = os.path.join(work_dir, f"style_{index:03d}.wav")
+        try:
+            source[start:end].export(path, format="wav")
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                refs[index] = path
+        except Exception:
+            continue
+    return refs
+
+
 # EBU R128 two-pass loudness (upgrade of the single-pass loudnorm we used at the
 # three render sites). Single-pass `loudnorm` normalises dynamically in one go, which
 # can pump or limit unevenly; measuring the finished mix first and then applying with
@@ -1791,6 +1829,7 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
     # MOSS-TTS-Nano is an optional ONNX CPU-friendly backend. It is only enabled
     # when the GUI sets MOSS_TTS_ENABLE=1, and falls back quietly like XTTS/OpenVoice.
     use_moss = False
+    use_confucius = False
     use_xtts = False
     if os.environ.get("MOSS_TTS_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
         try:
@@ -1799,6 +1838,12 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         except Exception as e:
             print(f"  [moss] unavailable ({str(e)[:70]}); using normal voice.", flush=True)
             use_moss = False
+    if os.environ.get("CONFUCIUS_TTS_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            import confucius_tts
+            use_confucius = lang in confucius_tts.LANGS and confucius_tts.available()
+        except Exception as e:
+            print(f"  [confucius] unavailable ({str(e)[:70]}); using normal voice.", flush=True)
 
     if use_elevenlabs:
         selected_voices: list[str] | str = elevenlabs_voice
@@ -1821,6 +1866,21 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
             ]
         paths = elevenlabs_tts_all(jobs, selected_voices, elevenlabs_key)
         seg_voices = (selected_voices if isinstance(selected_voices, list) else [selected_voices] * len(jobs))
+    elif use_confucius:
+        import confucius_tts
+        if spk_labels is not None and vocals:
+            spk_refs = build_speaker_refs(vocals, segs, spk_labels, seg_dir)
+        style_refs = build_segment_style_refs(vocals, segs, seg_dir) if vocals else {}
+        if style_refs:
+            print(f"  [confucius] matching delivery from {len(style_refs)} original line reference(s)", flush=True)
+        paths = confucius_tts.synthesize(
+            jobs,
+            vocals,
+            lang,
+            spk_labels=spk_labels,
+            spk_refs=spk_refs,
+            segment_refs=style_refs,
+        )
     elif use_moss:
         import moss_tts
         if spk_labels is not None and clone and vocals:
@@ -1854,7 +1914,7 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
                                     genders, lang, spk_labels=spk_labels, spk_refs=spk_refs)
         else:
             paths = tts_all(jobs, lang, seg_voices)
-    if clone and vocals and not use_elevenlabs and not use_moss and not use_xtts and spk_labels is None:
+    if clone and vocals and not use_elevenlabs and not use_confucius and not use_moss and not use_xtts and spk_labels is None:
         # (OpenVoice clones to ONE reference, which would collapse multi-speaker voices
         # back into a single voice, so we skip it when speakers were split.)
         print(f"__STAGE__ {lang.upper()}: cloning original voice", flush=True)
@@ -1881,13 +1941,13 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         hard_end = min([x for x in (nxt, visual_end, scene_end) if x > start] or [nxt])
         room = max(300, hard_end - start)                      # physical visual boundary
         fit_wav = os.path.join(seg_dir, f"{i:03d}_fit.wav")
-        if use_moss or use_xtts:
+        if use_confucius or use_moss or use_xtts:
             # Neural local TTS is already natural but can run a bit longer than the source.
             # Pitch-warping (tone=original) or hard time-compression mangles neural
             # speech into the "can't understand it" mush, so for XTTS we do neither:
             # no pitch shift, only a mild speed-up, and let the timeline drift and
             # recover at the next pause instead of cramming every line into its slot.
-            seg_audio = fit_segment(path, fit_wav, room, ffmpeg, max_tempo=1.15)
+            seg_audio = fit_segment(path, fit_wav, room, ffmpeg, max_tempo=1.08 if use_confucius else 1.15)
         elif tone == "original":
             st = orig_stats[i] if (orig_stats and i < len(orig_stats)) else None
             f0 = st.get("f0") if st else None
@@ -2004,7 +2064,7 @@ def make_dub(lang: str, segs: list[dict], total_ms: int, bed: str | None,
         subprocess.run(cmd)
     print("__PCT__ 100", flush=True)
     ok = os.path.exists(out_mp4)
-    print(f"  [{lang}] -> dubbed\\{base}_{lang}.mp4" + ("" if ok else "   (FAILED)"))
+    print(f"  [{lang}] -> dubbed\\{os.path.basename(out_mp4)}" + ("" if ok else "   (FAILED)"))
     if ok:
         # Machine-readable: lets the GUI pair this dub with its source for A/B preview.
         print(f"__OUT__\t{os.path.abspath(video)}\t{os.path.abspath(out_mp4)}", flush=True)
@@ -2047,8 +2107,13 @@ def _video_sig(video: str) -> dict:
 
 
 def load_analysis(work: str, base: str, video: str, model_size: str,
-                  analysis_key: str = "default") -> dict | None:
-    """Return the cached analysis for this video, or None when absent/stale."""
+                  analysis_key: str = "default", allow_compatible_reuse: bool = False) -> dict | None:
+    """Return cached analysis when the source matches.
+
+    Fast re-dub reuses the language-independent transcript even if the current
+    render selects a different Whisper size or output preset. Turning fast
+    re-dub off retains the stricter model/preset cache match for a fresh pass.
+    """
     p = _analysis_cache_path(work, base)
     if not os.path.exists(p):
         return None
@@ -2061,12 +2126,16 @@ def load_analysis(work: str, base: str, video: str, model_size: str,
         return None
     if data.get("sig") != _video_sig(video):
         return None
-    if data.get("model") != model_size:        # a different model -> re-transcribe
+    model_changed = data.get("model") != model_size
+    key_changed = data.get("analysis_key", "default") != analysis_key
+    if model_changed and not allow_compatible_reuse:
         return None
-    if data.get("analysis_key", "default") != analysis_key:
+    if key_changed and not allow_compatible_reuse:
         return None
     if not data.get("segs"):
         return None
+    if model_changed or key_changed:
+        data["compatible_reuse"] = True
     return data
 
 
@@ -2162,11 +2231,13 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
             speaker_override: dict | None = None,
             multimodal: bool = False, multimodal_vision: bool = True,
             multimodal_fps: float = 1.0):
+    api_key = _deepseek_key(api_key)
     video = os.path.abspath(video)
     base = os.path.splitext(os.path.basename(video))[0]
     speaker_override = normalize_speaker_override(speaker_override)
     facebook_reels = preset == "facebook_reels"
     moss_enabled = os.environ.get("MOSS_TTS_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+    confucius_enabled = os.environ.get("CONFUCIUS_TTS_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
     if facebook_reels:
         fb_vertical = True
         burn_subs = True
@@ -2175,7 +2246,7 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
         length_fit = False
         speakers_mode = True
         gender_mode = True
-        if not moss_enabled:
+        if not (moss_enabled or confucius_enabled):
             clone = False
         rights_mode = rights_mode or "owned_or_licensed"
         print("  preset: Facebook Reels Auto (owned/licensed source)", flush=True)
@@ -2191,14 +2262,14 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
     # Gender mode judges male/female from the speaker's pitch, which is only
     # reliable on the isolated voice - so it needs Demucs too, not just the
     # music-keeping/cloning paths. (bed is dropped below unless keepmusic.)
-    if keepmusic or clone or scene_fx or gender_mode or speakers_mode:
+    if keepmusic or clone or confucius_enabled or scene_fx or gender_mode or speakers_mode:
         bed, vocals = ensure_bed(video, base, work, ffmpeg)
     if not keepmusic:
         bed = None
-    if clone and speakers_mode and not moss_enabled:
+    if clone and speakers_mode and not (moss_enabled or confucius_enabled):
         print("  [clone] disabled for character voices; using separate cast voices.", flush=True)
         clone = False
-    if clone and not moss_enabled:
+    if clone and not (moss_enabled or confucius_enabled):
         import voiceclone
         if not voiceclone.available():
             print("  [clone] OpenVoice/torch not ready; see SETUP_VOICECLONE.md. Using normal voice.", flush=True)
@@ -2214,7 +2285,11 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
     analysis_key = ("facebook_reels_v2_story" if facebook_reels else "default")
     if multimodal:
         analysis_key += "_mm"
-    cached = load_analysis(work, base, video, model_size, analysis_key) if reuse_analysis else None
+    cached = (
+        load_analysis(work, base, video, model_size, analysis_key, allow_compatible_reuse=True)
+        if reuse_analysis
+        else None
+    )
     if cached:
         segs = cached["segs"]
         src_lang = cached["src_lang"]
@@ -2223,8 +2298,9 @@ def run_one(model, video, out_dir, ffmpeg, work, langs, keepmusic, cover_subs,
         median_dbfs = cached.get("median_dbfs")
         spk_labels = None if speaker_override["enforce_single_speaker"] else cached.get("spk_labels")
         alt_meta = cached.get("alt_meta") or {}
+        compatible = " (compatible render settings)" if cached.get("compatible_reuse") else ""
         print(f"  reusing cached analysis: {len(segs)} segments, source "
-              f"{src_lang} (skipping transcription)", flush=True)
+              f"{src_lang} (skipping transcription){compatible}", flush=True)
     else:
         segs, src_lang, alt_meta = transcribe_for_dub(
             model, video, vocals, total_ms, dual_pass=facebook_reels)
@@ -2298,8 +2374,17 @@ def _setup(ffmpeg, out_dir, work):
 
 
 def main() -> None:
+    usage = (
+        "Usage:\n"
+        "  python dub.py <video> <out_dir> <ffmpeg.exe> <work_dir> <langs> [model]\n"
+        "  python dub.py --jobs <jobs.json>"
+    )
+
     # Batch mode: one process, model loaded once, many videos.
-    if len(sys.argv) > 2 and sys.argv[1] == "--jobs":
+    if len(sys.argv) > 1 and sys.argv[1] == "--jobs":
+        if len(sys.argv) < 3:
+            print(usage, file=sys.stderr)
+            raise SystemExit(2)
         with open(sys.argv[2], encoding="utf-8") as f:
             cfg = json.load(f)
         ffmpeg, out_dir, work = _setup(cfg["ffmpeg"], cfg["out"], cfg["work"])
@@ -2310,6 +2395,12 @@ def main() -> None:
             os.environ.setdefault(
                 "MOSS_TTS_REPO",
                 os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "MOSS-TTS-Nano")),
+            )
+        if cfg.get("confucius_tts"):
+            os.environ["CONFUCIUS_TTS_ENABLE"] = "1"
+            os.environ.setdefault(
+                "CONFUCIUS_TTS_REPO",
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Confucius4-TTS")),
             )
         # GUI voice picker: each ticked language carries the chosen edge-tts voice.
         # Apply it (and drop Piper for that language) so the picked voice is what plays.
@@ -2356,6 +2447,10 @@ def main() -> None:
         return
 
     # Single-video mode (used by the .bat / folder buttons).
+    if len(sys.argv) < 6:
+        print(usage, file=sys.stderr)
+        raise SystemExit(2)
+
     video = sys.argv[1]
     ffmpeg, out_dir, work = _setup(sys.argv[3], sys.argv[2], sys.argv[4])
     langs = [x.strip() for x in sys.argv[5].split(",") if x.strip() in VOICES]

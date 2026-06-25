@@ -43,8 +43,14 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from feedback_storage import FeedbackStorage, ValidationError
 from self_learning_agent import optimize_dub_job_config
-import keyring
-from keyring.errors import KeyringError
+try:
+    import keyring
+    from keyring.errors import KeyringError
+except ModuleNotFoundError:
+    keyring = None
+
+    class KeyringError(Exception):
+        pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(HERE, "_audio_work")
@@ -66,6 +72,8 @@ ELEVENLABS_DEFAULT_VOICES = {
 
 
 def _secret(name: str) -> str:
+    if keyring is None:
+        return ""
     try:
         return (keyring.get_password(KEYRING_SERVICE, name) or "").strip()
     except KeyringError:
@@ -73,9 +81,14 @@ def _secret(name: str) -> str:
 
 
 def _save_secret(name: str, value: str) -> None:
+    if keyring is None:
+        return
     clean = value.strip()
     if clean:
-        keyring.set_password(KEYRING_SERVICE, name, clean)
+        try:
+            keyring.set_password(KEYRING_SERVICE, name, clean)
+        except KeyringError:
+            pass
 
 # Folders the /media endpoint is allowed to serve from (everything else is denied).
 def _safe_roots() -> list[str]:
@@ -400,7 +413,7 @@ def _saved_key() -> str:
 # Import (dub a new video) and Re-dub (re-voice edited translations) both drive
 # the SAME pipeline the GUI uses: `python dub.py --jobs <cfg.json>`. We don't
 # reimplement dubbing; we reuse it and stream its __STAGE__/__PCT__/__OUT__ log.
-JOB = {"proc": None, "lines": [], "done": True, "error": None, "label": ""}
+JOB = {"proc": None, "lines": [], "done": True, "error": None, "label": "", "outputs": [], "errors": []}
 _NEW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
@@ -449,6 +462,14 @@ def _base_cfg() -> dict:
     cfg.setdefault("langs", ",".join(_job_langs()))
     cfg.setdefault("model", "medium")
     cfg.setdefault("naming", "firstline")
+    # Vertical reframing belongs to the unified app's dedicated Edit 9:16 tab.
+    # Translation Editor always preserves the source frame.
+    cfg["preset"] = ""
+    cfg["fb"] = False
+    # Preserve the source atmosphere by default in every translation/editor run.
+    cfg["keepmusic"] = True
+    cfg["scenefx"] = True
+    cfg["tone"] = "original"
     cfg["reuse_analysis"] = True
     cfg["deepseek_key"] = ""
     cfg.pop("texts_override", None)
@@ -626,43 +647,41 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
     voices = s.get("voices") or {}
     tts_provider = str(s.get("tts_provider") or "elevenlabs")
     moss_tts = tts_provider == "moss"
+    confucius_tts = tts_provider == "confucius"
+    local_clone_tts = moss_tts or confucius_tts
     separate_speakers = bool(s.get("separate_speakers", True))
     speakers = bool(s.get("speakers")) or separate_speakers
     speaker_override = s.get("speaker_override") if isinstance(s.get("speaker_override"), dict) else {}
     enforce_single = bool(speaker_override.get("enforce_single_speaker"))
-    preset = s.get("preset") or ""
     rights_mode = s.get("rights_mode") or ""
-    facebook_reels = preset == "facebook_reels"
     elevenlabs_key = (s.get("elevenlabs_key") or "").strip() or _secret(ELEVENLABS_KEY_NAME)
     using_elevenlabs = tts_provider == "elevenlabs"
-    if facebook_reels:
-        speakers = True
-        rights_mode = rights_mode or "owned_or_licensed"
     if enforce_single:
         speakers = False
         gender = False
     else:
-        gender = bool(s.get("gender")) or facebook_reels
+        gender = bool(s.get("gender"))
     cfg = {
         "videos": [{"path": it["path"], "region": _region_str(it.get("region"))} for it in queue],
         "out": OUT, "work": WORK, "ffmpeg": _find_ffmpeg(),
         "langs": lang, "model": s.get("model", "medium"),
-        "preset": preset, "rights_mode": rights_mode,
-        "keepmusic": bool(s.get("keepmusic")) or facebook_reels,
-        "cover": bool(s.get("cover", True)) or facebook_reels,
-        "band": int(s.get("band", 18)), "fb": bool(s.get("fb")) or facebook_reels,
-        "srt": bool(s.get("srt")) or facebook_reels, "naming": "firstline",
-        "burn": bool(s.get("burn")) or facebook_reels,
+        "preset": "", "rights_mode": rights_mode,
+        "keepmusic": True,
+        "cover": bool(s.get("cover", True)),
+        "band": int(s.get("band", 18)), "fb": False,
+        "srt": bool(s.get("srt")), "naming": "firstline",
+        "burn": bool(s.get("burn")),
         "tone": s.get("tone", "original"), "audioonly": bool(s.get("audioonly")),
-        "clone": False if using_elevenlabs else bool(s.get("clone")) and (moss_tts or not (speakers or facebook_reels)),
+        "clone": False if using_elevenlabs else bool(s.get("clone")) and (local_clone_tts or not speakers),
         "moss_tts": moss_tts,
+        "confucius_tts": confucius_tts,
         "gender": gender or separate_speakers,
-        "speakers": speakers, "scenefx": bool(s.get("scenefx")),
-        "reuse_analysis": bool(s.get("reuse_analysis", True)),
+        "speakers": speakers, "scenefx": True,
+        "reuse_analysis": True,
         # Disabled from the web UI: per-line DeepSeek length fitting can hang on
         # long scripts, and the translation step already receives timing budgets.
         "length_fit": False,
-        "multimodal": bool(s.get("multimodal")) or facebook_reels,
+        "multimodal": bool(s.get("multimodal")),
         "multimodal_vision": bool(s.get("multimodal_vision", True)),
         "multimodal_fps": float(s.get("multimodal_fps", 1.0)),
         "expected_speakers": 1 if enforce_single else None,
@@ -673,10 +692,12 @@ def build_dub_cfg(s: dict, queue: list[dict]) -> dict:
         },
         "deepseek_key": "",
         "_runtime_deepseek_key": (s.get("deepseek_key") or "").strip() or _saved_key(),
-        "_runtime_elevenlabs_key": elevenlabs_key,
-        "elevenlabs_voice_id": elevenlabs_voice_for_gender(
-            str(s.get("elevenlabs_key") or "") or _secret(ELEVENLABS_KEY_NAME),
-            str(s.get("elevenlabs_gender") or "female"),
+        "_runtime_elevenlabs_key": elevenlabs_key if using_elevenlabs else "",
+        "elevenlabs_voice_id": (
+            elevenlabs_voice_for_gender(
+                str(s.get("elevenlabs_key") or "") or _secret(ELEVENLABS_KEY_NAME),
+                str(s.get("elevenlabs_gender") or "female"),
+            ) if using_elevenlabs else ""
         ),
         "elevenlabs_voice_pools": {
             "female": elevenlabs_voice_pool(elevenlabs_key, "female"),
@@ -786,7 +807,10 @@ def build_redub_cfg(proj_file: str, tr: dict | None = None) -> tuple[dict | None
     cfg["langs"] = lang
     cfg["naming"] = "firstline"
     cfg["audioonly"] = bool(d.get("audio_only"))
-    cfg["preset"] = d.get("preset", cfg.get("preset", ""))
+    cfg["preset"] = ""
+    cfg["fb"] = False
+    cfg["keepmusic"] = True
+    cfg["scenefx"] = True
     cfg["rights_mode"] = d.get("rights_mode", cfg.get("rights_mode", ""))
     cfg["texts_override"] = {lang: [s.get("tr", "") for s in d.get("segments", [])]}
     return cfg, d, None
@@ -803,7 +827,7 @@ def _start_job(cfg: dict, label: str) -> tuple[bool, str | None]:
     if runtime_key:
         cfg["deepseek_key"] = ""
     json.dump(cfg, open(jobs_path, "w", encoding="utf-8"), ensure_ascii=False)
-    JOB.update(proc=None, lines=[], done=False, error=None, label=label)
+    JOB.update(proc=None, lines=[], done=False, error=None, label=label, outputs=[], errors=[])
     env = os.environ.copy()
     if runtime_key:
         env["DEEPSEEK_API_KEY"] = runtime_key
@@ -814,6 +838,9 @@ def _start_job(cfg: dict, label: str) -> tuple[bool, str | None]:
     if cfg.get("moss_tts"):
         env["MOSS_TTS_ENABLE"] = "1"
         env.setdefault("MOSS_TTS_REPO", os.path.abspath(os.path.join(HERE, "..", "MOSS-TTS-Nano")))
+    if cfg.get("confucius_tts"):
+        env["CONFUCIUS_TTS_ENABLE"] = "1"
+        env.setdefault("CONFUCIUS_TTS_REPO", os.path.abspath(os.path.join(HERE, "..", "Confucius4-TTS")))
     p = subprocess.Popen([sys.executable, os.path.join(HERE, "dub.py"), "--jobs", jobs_path],
                          cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, encoding="utf-8", errors="replace", creationflags=_NEW,
@@ -822,10 +849,21 @@ def _start_job(cfg: dict, label: str) -> tuple[bool, str | None]:
 
     def reader():
         for line in p.stdout:
-            JOB["lines"].append(line.rstrip("\n"))
+            clean = line.rstrip("\n")
+            JOB["lines"].append(clean)
+            if clean.startswith("__OUT__"):
+                parts = clean.split("\t")
+                if len(parts) >= 3:
+                    JOB["outputs"].append({"source": parts[1], "output": parts[2]})
+            elif re.search(r"\b(ERROR|FAILED|Traceback|cannot|No audio was received)\b", clean):
+                JOB["errors"].append(clean)
             if len(JOB["lines"]) > 600:
                 JOB["lines"] = JOB["lines"][-400:]
+            if len(JOB["errors"]) > 80:
+                JOB["errors"] = JOB["errors"][-60:]
         p.wait()
+        if p.returncode and not JOB["outputs"]:
+            JOB["errors"].append(f"Worker exited with code {p.returncode}.")
         JOB["done"] = True
 
     threading.Thread(target=reader, daemon=True).start()
@@ -891,7 +929,8 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/job":
                 running = JOB["proc"] is not None and JOB["proc"].poll() is None
                 return self._json({"running": running, "done": JOB["done"],
-                                   "label": JOB["label"], "lines": JOB["lines"][-60:]})
+                                   "label": JOB["label"], "lines": JOB["lines"][-60:],
+                                   "outputs": JOB["outputs"], "errors": JOB["errors"][-20:]})
             if u.path == "/media":
                 return self._serve_media(q.get("path", [""])[0])
             self.send_error(404)
